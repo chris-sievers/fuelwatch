@@ -1,0 +1,31 @@
+{
+  "MessageType": "ShipStaticData",
+  "MetaData": {
+    "MMSI": 636019825,
+    "MMSI_String": 636019825,
+    "ShipName": "EXAMPLE TANKER      ",
+    "latitude": 26.6,
+    "longitude": 56.25,
+    "time_utc": "2026-10-16 12:00:05.000000000 +0000 UTC"
+  },
+  "Message": {
+    "ShipStaticData": {
+      "AisVersion": 2,
+      "CallSign": "D5AB1  ",
+      "Destination": "FUJAIRAH            ",
+      "Dimension": {"A": 200, "B": 50, "C": 20, "D": 24},
+      "Dte": false,
+      "Eta": {"Day": 18, "Hour": 6, "Minute": 0, "Month": 10},
+      "FixType": 1,
+      "ImoNumber": 9123456,
+      "MaximumStaticDraught": 14.2,
+      "MessageID": 5,
+      "Name": "EXAMPLE TANKER@@@@@@",
+      "RepeatIndicator": 0,
+      "Spare": false,
+      "Type": 80,
+      "UserID": 636019825,
+      "Valid": true
+    }
+  }
+}
