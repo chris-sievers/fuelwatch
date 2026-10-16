@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fuelwatch"
+version = "0.0.0"
+description = "Self-hosted dashboard for crude prices, US pump prices, fuel stocks and Strait of Hormuz shipping"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27",
+  "websockets>=12",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "respx>=0.21",
+  "ruff>=0.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fuelwatch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "contract: calls a real provider; runs only with FW_CONTRACT=1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
