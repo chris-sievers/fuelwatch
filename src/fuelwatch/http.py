@@ -63,7 +63,9 @@ async def get_json(client: httpx.AsyncClient, url: str, **params) -> object:
         resp.raise_for_status()
         return resp.json()
     except httpx.HTTPStatusError as e:
-        raise ProviderError("http_status", f"{e.response.status_code} from {e.request.url}") from None
+        raise ProviderError(
+            "http_status", f"{e.response.status_code} from {e.request.url}"
+        ) from None
     except httpx.TransportError as e:
         raise ProviderError("transport", f"{type(e).__name__} calling {redact(url)}") from None
     except ValueError:

@@ -14,3 +14,5 @@ data/*
 htmlcov/
 dist/
 build/
+.claude/
+.ruff_cache/

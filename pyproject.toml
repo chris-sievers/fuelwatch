@@ -26,6 +26,7 @@ packages = ["src/fuelwatch"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = "--import-mode=importlib"
 markers = [
   "contract: calls a real provider; runs only with FW_CONTRACT=1",
 ]
