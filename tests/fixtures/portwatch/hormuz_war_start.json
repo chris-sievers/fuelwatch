@@ -1,0 +1,100 @@
+{
+ "objectIdFieldName": "ObjectId",
+ "uniqueIdField": {
+  "name": "ObjectId",
+  "isSystemMaintained": true
+ },
+ "globalIdFieldName": "",
+ "features": [
+  {
+   "attributes": {
+    "date": "2026-02-26",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 89,
+    "n_tanker": 45,
+    "capacity_tanker": 909158
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-02-27",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 64,
+    "n_tanker": 37,
+    "capacity_tanker": 1196784
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-02-28",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 57,
+    "n_tanker": 36,
+    "capacity_tanker": 2598963
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-03-01",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 20,
+    "n_tanker": 5,
+    "capacity_tanker": 153007
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-03-02",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 4,
+    "n_tanker": 1,
+    "capacity_tanker": 0
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-03-03",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 4,
+    "n_tanker": 1,
+    "capacity_tanker": 6701
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-03-04",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 0,
+    "n_tanker": 0,
+    "capacity_tanker": 0
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-03-05",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 3,
+    "n_tanker": 1,
+    "capacity_tanker": 0
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-03-06",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 2,
+    "n_tanker": 0,
+    "capacity_tanker": 0
+   }
+  }
+ ]
+}

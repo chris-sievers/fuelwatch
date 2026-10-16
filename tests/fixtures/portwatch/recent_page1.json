@@ -1,0 +1,211 @@
+{
+ "objectIdFieldName": "ObjectId",
+ "uniqueIdField": {
+  "name": "ObjectId",
+  "isSystemMaintained": true
+ },
+ "globalIdFieldName": "",
+ "exceededTransferLimit": true,
+ "features": [
+  {
+   "attributes": {
+    "date": "2026-10-05",
+    "portid": "chokepoint1",
+    "portname": "Suez Canal",
+    "n_total": 36,
+    "n_tanker": 17,
+    "capacity_tanker": 502731
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-05",
+    "portid": "chokepoint4",
+    "portname": "Bab el-Mandeb Strait",
+    "n_total": 28,
+    "n_tanker": 13,
+    "capacity_tanker": 841422
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-05",
+    "portid": "chokepoint5",
+    "portname": "Malacca Strait",
+    "n_total": 217,
+    "n_tanker": 58,
+    "capacity_tanker": 1886297
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-05",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 8,
+    "n_tanker": 1,
+    "capacity_tanker": 4771
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-05",
+    "portid": "chokepoint7",
+    "portname": "Cape of Good Hope",
+    "n_total": 92,
+    "n_tanker": 22,
+    "capacity_tanker": 1667470
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-06",
+    "portid": "chokepoint1",
+    "portname": "Suez Canal",
+    "n_total": 48,
+    "n_tanker": 18,
+    "capacity_tanker": 789069
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-06",
+    "portid": "chokepoint4",
+    "portname": "Bab el-Mandeb Strait",
+    "n_total": 33,
+    "n_tanker": 8,
+    "capacity_tanker": 309097
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-06",
+    "portid": "chokepoint5",
+    "portname": "Malacca Strait",
+    "n_total": 251,
+    "n_tanker": 79,
+    "capacity_tanker": 2089240
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-06",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 2,
+    "n_tanker": 1,
+    "capacity_tanker": 119052
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-06",
+    "portid": "chokepoint7",
+    "portname": "Cape of Good Hope",
+    "n_total": 75,
+    "n_tanker": 16,
+    "capacity_tanker": 1756840
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-07",
+    "portid": "chokepoint1",
+    "portname": "Suez Canal",
+    "n_total": 32,
+    "n_tanker": 15,
+    "capacity_tanker": 582474
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-07",
+    "portid": "chokepoint4",
+    "portname": "Bab el-Mandeb Strait",
+    "n_total": 35,
+    "n_tanker": 12,
+    "capacity_tanker": 707143
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-07",
+    "portid": "chokepoint5",
+    "portname": "Malacca Strait",
+    "n_total": 239,
+    "n_tanker": 73,
+    "capacity_tanker": 1821850
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-07",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 6,
+    "n_tanker": 1,
+    "capacity_tanker": 40860
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-07",
+    "portid": "chokepoint7",
+    "portname": "Cape of Good Hope",
+    "n_total": 84,
+    "n_tanker": 18,
+    "capacity_tanker": 1137654
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-08",
+    "portid": "chokepoint1",
+    "portname": "Suez Canal",
+    "n_total": 37,
+    "n_tanker": 14,
+    "capacity_tanker": 655395
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-08",
+    "portid": "chokepoint4",
+    "portname": "Bab el-Mandeb Strait",
+    "n_total": 25,
+    "n_tanker": 9,
+    "capacity_tanker": 309167
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-08",
+    "portid": "chokepoint5",
+    "portname": "Malacca Strait",
+    "n_total": 232,
+    "n_tanker": 77,
+    "capacity_tanker": 2545532
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-08",
+    "portid": "chokepoint6",
+    "portname": "Strait of Hormuz",
+    "n_total": 4,
+    "n_tanker": 0,
+    "capacity_tanker": 0
+   }
+  },
+  {
+   "attributes": {
+    "date": "2026-10-08",
+    "portid": "chokepoint7",
+    "portname": "Cape of Good Hope",
+    "n_total": 82,
+    "n_tanker": 16,
+    "capacity_tanker": 659885
+   }
+  }
+ ]
+}
