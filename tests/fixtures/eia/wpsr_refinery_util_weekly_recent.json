@@ -1,0 +1,90 @@
+{
+ "warnings": [
+  {
+   "warning": "incomplete return",
+   "description": "The API can only return 5000 rows in JSON format.  Please consider constraining your request with facet, start, or end, or using offset to paginate results."
+  }
+ ],
+ "response": {
+  "total": "1876",
+  "dateFormat": "YYYY-MM-DD",
+  "frequency": "weekly",
+  "data": [
+   {
+    "period": "2026-10-09",
+    "duoarea": "NUS",
+    "area-name": "U.S.",
+    "product": "(NA)",
+    "product-name": "Not Applicable",
+    "process": "YUP",
+    "process-name": "% Utilization Refinery Operable Capacity",
+    "series": "WPULEUS3",
+    "series-description": "U.S. Percent Utilization of Refinery Operable Capacity",
+    "value": "93.5",
+    "units": "%"
+   },
+   {
+    "period": "2026-10-02",
+    "duoarea": "NUS",
+    "area-name": "U.S.",
+    "product": "(NA)",
+    "product-name": "Not Applicable",
+    "process": "YUP",
+    "process-name": "% Utilization Refinery Operable Capacity",
+    "series": "WPULEUS3",
+    "series-description": "U.S. Percent Utilization of Refinery Operable Capacity",
+    "value": "92.7",
+    "units": "%"
+   },
+   {
+    "period": "2026-09-25",
+    "duoarea": "NUS",
+    "area-name": "U.S.",
+    "product": "(NA)",
+    "product-name": "Not Applicable",
+    "process": "YUP",
+    "process-name": "% Utilization Refinery Operable Capacity",
+    "series": "WPULEUS3",
+    "series-description": "U.S. Percent Utilization of Refinery Operable Capacity",
+    "value": "92.5",
+    "units": "%"
+   },
+   {
+    "period": "2026-09-18",
+    "duoarea": "NUS",
+    "area-name": "U.S.",
+    "product": "(NA)",
+    "product-name": "Not Applicable",
+    "process": "YUP",
+    "process-name": "% Utilization Refinery Operable Capacity",
+    "series": "WPULEUS3",
+    "series-description": "U.S. Percent Utilization of Refinery Operable Capacity",
+    "value": "94",
+    "units": "%"
+   }
+  ]
+ },
+ "request": {
+  "command": "/v2/petroleum/pnp/wiup/data/",
+  "params": {
+   "frequency": "weekly",
+   "data": [
+    "value"
+   ],
+   "facets": {
+    "series": [
+     "WPULEUS3"
+    ]
+   },
+   "sort": [
+    {
+     "column": "period",
+     "direction": "desc"
+    }
+   ],
+   "length": "4"
+  }
+ },
+ "apiVersion": "2.1.14",
+ "ExcelAddInVersion": "2.1.0"
+}
