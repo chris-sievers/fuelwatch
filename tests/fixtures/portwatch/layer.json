@@ -1,0 +1,128 @@
+{
+ "currentVersion": 12,
+ "id": 0,
+ "name": "Daily_Chokepoints_Data",
+ "type": "Table",
+ "editingInfo": {
+  "lastEditDate": 1791981584689,
+  "schemaLastEditDate": 1791981584689,
+  "dataLastEditDate": 1791981584689
+ },
+ "maxRecordCount": 1000,
+ "objectIdField": "ObjectId",
+ "dateFieldsTimeReference": {
+  "timeZone": "UTC",
+  "timeZoneIANA": "Etc/UTC",
+  "respectsDaylightSaving": false
+ },
+ "advancedQueryCapabilities": {
+  "supportsPagination": true
+ },
+ "fields": [
+  {
+   "name": "date",
+   "type": "esriFieldTypeDateOnly",
+   "alias": "date"
+  },
+  {
+   "name": "year",
+   "type": "esriFieldTypeInteger",
+   "alias": "year"
+  },
+  {
+   "name": "month",
+   "type": "esriFieldTypeInteger",
+   "alias": "month"
+  },
+  {
+   "name": "day",
+   "type": "esriFieldTypeInteger",
+   "alias": "day"
+  },
+  {
+   "name": "portid",
+   "type": "esriFieldTypeString",
+   "alias": "portid"
+  },
+  {
+   "name": "portname",
+   "type": "esriFieldTypeString",
+   "alias": "portname"
+  },
+  {
+   "name": "n_container",
+   "type": "esriFieldTypeInteger",
+   "alias": "n_container"
+  },
+  {
+   "name": "n_dry_bulk",
+   "type": "esriFieldTypeInteger",
+   "alias": "n_dry_bulk"
+  },
+  {
+   "name": "n_general_cargo",
+   "type": "esriFieldTypeInteger",
+   "alias": "n_general_cargo"
+  },
+  {
+   "name": "n_roro",
+   "type": "esriFieldTypeInteger",
+   "alias": "n_roro"
+  },
+  {
+   "name": "n_tanker",
+   "type": "esriFieldTypeInteger",
+   "alias": "n_tanker"
+  },
+  {
+   "name": "n_cargo",
+   "type": "esriFieldTypeInteger",
+   "alias": "n_cargo"
+  },
+  {
+   "name": "n_total",
+   "type": "esriFieldTypeInteger",
+   "alias": "n_total"
+  },
+  {
+   "name": "capacity_container",
+   "type": "esriFieldTypeInteger",
+   "alias": "capacity_container"
+  },
+  {
+   "name": "capacity_dry_bulk",
+   "type": "esriFieldTypeInteger",
+   "alias": "capacity_dry_bulk"
+  },
+  {
+   "name": "capacity_general_cargo",
+   "type": "esriFieldTypeInteger",
+   "alias": "capacity_general_cargo"
+  },
+  {
+   "name": "capacity_roro",
+   "type": "esriFieldTypeInteger",
+   "alias": "capacity_roro"
+  },
+  {
+   "name": "capacity_tanker",
+   "type": "esriFieldTypeInteger",
+   "alias": "capacity_tanker"
+  },
+  {
+   "name": "capacity_cargo",
+   "type": "esriFieldTypeInteger",
+   "alias": "capacity_cargo"
+  },
+  {
+   "name": "capacity",
+   "type": "esriFieldTypeInteger",
+   "alias": "capacity"
+  },
+  {
+   "name": "ObjectId",
+   "type": "esriFieldTypeOID",
+   "alias": "ObjectId"
+  }
+ ]
+}
