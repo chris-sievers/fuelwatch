@@ -1,0 +1,197 @@
+{
+ "warnings": [
+  {
+   "warning": "incomplete return",
+   "description": "The API can only return 5000 rows in JSON format.  Please consider constraining your request with facet, start, or end, or using offset to paginate results."
+  }
+ ],
+ "response": {
+  "total": "35538",
+  "dateFormat": "YYYY-MM-DD",
+  "frequency": "daily",
+  "data": [
+   {
+    "period": "2026-10-14",
+    "duoarea": "YCUOK",
+    "area-name": "NA",
+    "product": "EPCWTI",
+    "product-name": "WTI Crude Oil",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "RWTC",
+    "series-description": "Cushing, OK WTI Spot Price FOB (Dollars per Barrel)",
+    "value": "101.91",
+    "units": "$/BBL"
+   },
+   {
+    "period": "2026-10-14",
+    "duoarea": "Y35NY",
+    "area-name": "NEW YORK CITY",
+    "product": "EPMRU",
+    "product-name": "Conventional Regular Gasoline",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "EER_EPMRU_PF4_Y35NY_DPG",
+    "series-description": "New York Harbor Conventional Gasoline Regular Spot Price FOB (Dollars per Gallon)",
+    "value": "2.987",
+    "units": "$/GAL"
+   },
+   {
+    "period": "2026-10-14",
+    "duoarea": "Y35NY",
+    "area-name": "NEW YORK CITY",
+    "product": "EPD2DXL0",
+    "product-name": "No 2 Diesel Low Sulfur (0-15 ppm)",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "EER_EPD2DXL0_PF4_Y35NY_DPG",
+    "series-description": "New York Harbor Ultra-Low Sulfur No 2 Diesel Spot Price (Dollars per Gallon)",
+    "value": "5.066",
+    "units": "$/GAL"
+   },
+   {
+    "period": "2026-10-14",
+    "duoarea": "ZEU",
+    "area-name": "NA",
+    "product": "EPCBRENT",
+    "product-name": "UK Brent Crude Oil",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "RBRTE",
+    "series-description": "Europe Brent Spot Price FOB (Dollars per Barrel)",
+    "value": "126.55",
+    "units": "$/BBL"
+   },
+   {
+    "period": "2026-10-13",
+    "duoarea": "Y35NY",
+    "area-name": "NEW YORK CITY",
+    "product": "EPD2DXL0",
+    "product-name": "No 2 Diesel Low Sulfur (0-15 ppm)",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "EER_EPD2DXL0_PF4_Y35NY_DPG",
+    "series-description": "New York Harbor Ultra-Low Sulfur No 2 Diesel Spot Price (Dollars per Gallon)",
+    "value": "5.114",
+    "units": "$/GAL"
+   },
+   {
+    "period": "2026-10-13",
+    "duoarea": "Y35NY",
+    "area-name": "NEW YORK CITY",
+    "product": "EPMRU",
+    "product-name": "Conventional Regular Gasoline",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "EER_EPMRU_PF4_Y35NY_DPG",
+    "series-description": "New York Harbor Conventional Gasoline Regular Spot Price FOB (Dollars per Gallon)",
+    "value": "2.988",
+    "units": "$/GAL"
+   },
+   {
+    "period": "2026-10-13",
+    "duoarea": "YCUOK",
+    "area-name": "NA",
+    "product": "EPCWTI",
+    "product-name": "WTI Crude Oil",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "RWTC",
+    "series-description": "Cushing, OK WTI Spot Price FOB (Dollars per Barrel)",
+    "value": "100.86",
+    "units": "$/BBL"
+   },
+   {
+    "period": "2026-10-13",
+    "duoarea": "ZEU",
+    "area-name": "NA",
+    "product": "EPCBRENT",
+    "product-name": "UK Brent Crude Oil",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "RBRTE",
+    "series-description": "Europe Brent Spot Price FOB (Dollars per Barrel)",
+    "value": "125.78",
+    "units": "$/BBL"
+   },
+   {
+    "period": "2026-10-12",
+    "duoarea": "YCUOK",
+    "area-name": "NA",
+    "product": "EPCWTI",
+    "product-name": "WTI Crude Oil",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "RWTC",
+    "series-description": "Cushing, OK WTI Spot Price FOB (Dollars per Barrel)",
+    "value": "98.73",
+    "units": "$/BBL"
+   },
+   {
+    "period": "2026-10-12",
+    "duoarea": "Y35NY",
+    "area-name": "NEW YORK CITY",
+    "product": "EPMRU",
+    "product-name": "Conventional Regular Gasoline",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "EER_EPMRU_PF4_Y35NY_DPG",
+    "series-description": "New York Harbor Conventional Gasoline Regular Spot Price FOB (Dollars per Gallon)",
+    "value": "3.02",
+    "units": "$/GAL"
+   },
+   {
+    "period": "2026-10-12",
+    "duoarea": "Y35NY",
+    "area-name": "NEW YORK CITY",
+    "product": "EPD2DXL0",
+    "product-name": "No 2 Diesel Low Sulfur (0-15 ppm)",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "EER_EPD2DXL0_PF4_Y35NY_DPG",
+    "series-description": "New York Harbor Ultra-Low Sulfur No 2 Diesel Spot Price (Dollars per Gallon)",
+    "value": "4.91",
+    "units": "$/GAL"
+   },
+   {
+    "period": "2026-10-12",
+    "duoarea": "ZEU",
+    "area-name": "NA",
+    "product": "EPCBRENT",
+    "product-name": "UK Brent Crude Oil",
+    "process": "PF4",
+    "process-name": "Spot Price FOB",
+    "series": "RBRTE",
+    "series-description": "Europe Brent Spot Price FOB (Dollars per Barrel)",
+    "value": "129.95",
+    "units": "$/BBL"
+   }
+  ]
+ },
+ "request": {
+  "command": "/v2/petroleum/pri/spt/data/",
+  "params": {
+   "frequency": "daily",
+   "data": [
+    "value"
+   ],
+   "facets": {
+    "series": [
+     "RBRTE",
+     "RWTC",
+     "EER_EPMRU_PF4_Y35NY_DPG",
+     "EER_EPD2DXL0_PF4_Y35NY_DPG"
+    ]
+   },
+   "sort": [
+    {
+     "column": "period",
+     "direction": "desc"
+    }
+   ],
+   "length": "40"
+  }
+ },
+ "apiVersion": "2.1.14",
+ "ExcelAddInVersion": "2.1.0"
+}
