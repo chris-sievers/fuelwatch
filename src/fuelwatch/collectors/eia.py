@@ -108,13 +108,19 @@ GROUPS: tuple[Group, ...] = (
         "petroleum/pri/gnd",
         Frequency.WEEKLY,
         tuple(
-            _retail(f"eia.retail.gasoline.{key}", f"Regular gasoline retail, {label}",
-                    f"EMM_EPMR_PTE_{code}_DPG")
+            _retail(
+                f"eia.retail.gasoline.{key}",
+                f"Regular gasoline retail, {label}",
+                f"EMM_EPMR_PTE_{code}_DPG",
+            )
             for key, label, code in _REGIONS
         )
         + tuple(
-            _retail(f"eia.retail.diesel.{key}", f"On-highway diesel retail, {label}",
-                    f"EMD_EPD2D_PTE_{code}_DPG")
+            _retail(
+                f"eia.retail.diesel.{key}",
+                f"On-highway diesel retail, {label}",
+                f"EMD_EPD2D_PTE_{code}_DPG",
+            )
             for key, label, code in _REGIONS
         ),
     ),
@@ -122,22 +128,51 @@ GROUPS: tuple[Group, ...] = (
         "petroleum/stoc/wstk",
         Frequency.WEEKLY,
         (
-            _wpsr("eia.stocks.crude_commercial", "US commercial crude stocks (excl. SPR)",
-                  "million bbl", "WCESTUS1", "MBBL", 0.001),
-            _wpsr("eia.stocks.gasoline", "US total motor gasoline stocks",
-                  "million bbl", "WGTSTUS1", "MBBL", 0.001),
-            _wpsr("eia.stocks.distillate", "US distillate fuel oil stocks",
-                  "million bbl", "WDISTUS1", "MBBL", 0.001),
-            _wpsr("eia.stocks.spr", "US Strategic Petroleum Reserve crude stocks",
-                  "million bbl", "WCSSTUS1", "MBBL", 0.001),
+            _wpsr(
+                "eia.stocks.crude_commercial",
+                "US commercial crude stocks (excl. SPR)",
+                "million bbl",
+                "WCESTUS1",
+                "MBBL",
+                0.001,
+            ),
+            _wpsr(
+                "eia.stocks.gasoline",
+                "US total motor gasoline stocks",
+                "million bbl",
+                "WGTSTUS1",
+                "MBBL",
+                0.001,
+            ),
+            _wpsr(
+                "eia.stocks.distillate",
+                "US distillate fuel oil stocks",
+                "million bbl",
+                "WDISTUS1",
+                "MBBL",
+                0.001,
+            ),
+            _wpsr(
+                "eia.stocks.spr",
+                "US Strategic Petroleum Reserve crude stocks",
+                "million bbl",
+                "WCSSTUS1",
+                "MBBL",
+                0.001,
+            ),
         ),
     ),
     Group(
         "petroleum/pnp/wiup",
         Frequency.WEEKLY,
         (
-            _wpsr("eia.refinery.utilization", "US refinery utilization, operable capacity",
-                  "%", "WPULEUS3", "%"),
+            _wpsr(
+                "eia.refinery.utilization",
+                "US refinery utilization, operable capacity",
+                "%",
+                "WPULEUS3",
+                "%",
+            ),
         ),
     ),
 )
@@ -179,8 +214,9 @@ def parse_response(doc: object, group: Group) -> list[Point]:
     resp = doc["response"]
     freq = resp.get("frequency")
     if freq is not None and freq != group.frequency.value:
-        raise ProviderError("schema", f"EIA {group.route}: frequency {freq!r}, "
-                            f"expected {group.frequency.value!r}")
+        raise ProviderError(
+            "schema", f"EIA {group.route}: frequency {freq!r}, expected {group.frequency.value!r}"
+        )
     rows = resp.get("data")
     if not isinstance(rows, list):
         raise ProviderError("schema", f"EIA {group.route}: 'data' is not a list")
@@ -194,13 +230,15 @@ def parse_response(doc: object, group: Group) -> list[Point]:
         if s is None:
             continue
         if row.get("units") != s.eia_units:
-            raise ProviderError("schema", f"EIA {s.eia_id}: units {row.get('units')!r}, "
-                                f"expected {s.eia_units!r}")
+            raise ProviderError(
+                "schema", f"EIA {s.eia_id}: units {row.get('units')!r}, expected {s.eia_units!r}"
+            )
         period = parse_period(row.get("period"))
         value = parse_value(row.get("value"))
         if value is None:
-            log.info("EIA %s %s: no value (%r), leaving a gap", s.eia_id,
-                     period.date(), row.get("value"))
+            log.info(
+                "EIA %s %s: no value (%r), leaving a gap", s.eia_id, period.date(), row.get("value")
+            )
             continue
         points.append(Point(s.spec.id, period, round(value * s.scale, 6)))
     return points

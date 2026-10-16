@@ -172,9 +172,7 @@ def _orient(p: tuple[float, float], q: tuple[float, float], r: tuple[float, floa
     return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
 
 
-def segments_cross(
-    p1: tuple[float, float], p2: tuple[float, float], line: Line
-) -> bool:
+def segments_cross(p1: tuple[float, float], p2: tuple[float, float], line: Line) -> bool:
     """True if the track p1->p2 properly crosses the line (touching an end
     point or running along it does not count). Planar lat/lon is fine at
     this scale."""

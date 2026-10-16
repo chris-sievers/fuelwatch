@@ -37,8 +37,7 @@ def fixture(name: str) -> bytes:
 
 def test_parse_position_report_fixture():
     msg = parse_frame(fixture("position_report.json"))
-    assert msg == PositionMsg(mmsi=636019825, lat=26.6, lon=56.25, sog=12.3, cog=112.5,
-                              heading=111)
+    assert msg == PositionMsg(mmsi=636019825, lat=26.6, lon=56.25, sog=12.3, cog=112.5, heading=111)
 
 
 def test_parse_ship_static_data_fixture():
@@ -63,15 +62,24 @@ def test_error_frame_is_reported():
     assert parse_frame(b'{"error": "Api Key Is Not Valid"}') == ErrorMsg("Api Key Is Not Valid")
 
 
-@pytest.mark.parametrize("raw", [
-    b"", b"not json", b"[]", b"null", b"\xff\xfe", b'{"MessageType": "PositionReport"}',
-    b'{"MessageType": "PositionReport", "Message": {"PositionReport": []}}',
-    b'{"MessageType": "PositionReport", "Message": {"ShipStaticData": {}}}',
-    b'{"MessageType": "AidsToNavigationReport", "Message": {"AidsToNavigationReport": {}}}',
-    b'{"MessageType": "PositionReport", "Message": {"PositionReport": {"Valid": false}}}',
-    b'{"MessageType": "PositionReport", "Message": {"PositionReport": {}}, "x": "'
-    + b"a" * 20_000 + b'"}',
-])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"",
+        b"not json",
+        b"[]",
+        b"null",
+        b"\xff\xfe",
+        b'{"MessageType": "PositionReport"}',
+        b'{"MessageType": "PositionReport", "Message": {"PositionReport": []}}',
+        b'{"MessageType": "PositionReport", "Message": {"ShipStaticData": {}}}',
+        b'{"MessageType": "AidsToNavigationReport", "Message": {"AidsToNavigationReport": {}}}',
+        b'{"MessageType": "PositionReport", "Message": {"PositionReport": {"Valid": false}}}',
+        b'{"MessageType": "PositionReport", "Message": {"PositionReport": {}}, "x": "'
+        + b"a" * 20_000
+        + b'"}',
+    ],
+)
 def test_malformed_or_oversized_frames_ignored(raw):
     assert parse_frame(raw) is None
 
@@ -135,9 +143,15 @@ class Clock:
 
 
 async def test_session_marks_live_then_disconnected_and_backs_off():
-    sockets = [FakeWS([fixture("subscription_confirmation.json"),
-                       fixture("position_report.json"),
-                       fixture("ship_static_data.json")])]
+    sockets = [
+        FakeWS(
+            [
+                fixture("subscription_confirmation.json"),
+                fixture("position_report.json"),
+                fixture("ship_static_data.json"),
+            ]
+        )
+    ]
     stop = asyncio.Event()
     delays = []
     clock = Clock(T0 + timedelta(seconds=5))
@@ -211,8 +225,11 @@ async def test_ticker_emits_only_covered_slots_and_never_zeros():
 
     ends = [pts[0].period_end for pts in emitted]
     # 12:10 partial (started 12:03); 12:30 and 12:40 overlap the outage; 12:50 onwards covered
-    assert ends == [T0 + timedelta(minutes=20), T0 + timedelta(minutes=50),
-                    T0 + timedelta(minutes=60)]
+    assert ends == [
+        T0 + timedelta(minutes=20),
+        T0 + timedelta(minutes=50),
+        T0 + timedelta(minutes=60),
+    ]
     first = {p.series: p.value for p in emitted[0]}
     assert first[SERIES_SHIPS] == 1 and first[SERIES_TANKERS] == 0
 

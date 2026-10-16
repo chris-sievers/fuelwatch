@@ -38,8 +38,19 @@ def values(points):
 # --- tanker typing ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("code,expected", [(79, False), (80, True), (84, True), (89, True),
-                                           (90, False), (70, False), (0, False), (None, False)])
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        (79, False),
+        (80, True),
+        (84, True),
+        (89, True),
+        (90, False),
+        (70, False),
+        (0, False),
+        (None, False),
+    ],
+)
 def test_tanker_types_are_80_to_89(code, expected):
     assert is_tanker(code) is expected
 
@@ -190,7 +201,12 @@ def test_snapshot_is_read_only_copy():
     t.static("636019825", 80, "EXAMPLE TANKER@@@@@@", T0)
     (ship,) = t.snapshot(T0 + MIN)
     assert (ship.mmsi, ship.lat, ship.lon, ship.tanker, ship.name) == (
-        "636019825", 26.6, 56.35, True, "EXAMPLE TANKER")
+        "636019825",
+        26.6,
+        56.35,
+        True,
+        "EXAMPLE TANKER",
+    )
     with pytest.raises(AttributeError):
         ship.lat = 0.0  # frozen
     assert isinstance(t.snapshot(T0 + MIN), tuple)
@@ -217,11 +233,29 @@ def test_cap_of_5000_ships_evicts_least_recently_heard():
 # --- untrusted input -------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", [
-    "12345678", "1234567890", "000000000", "123456789", "111234567", "800123456",
-    "970123456", "992351000", "999999999", "776000000", "20100000a", "２０１０００００１",
-    True, None, 2.01e8, [201000001], {"m": 1}, -201000001,
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "12345678",
+        "1234567890",
+        "000000000",
+        "123456789",
+        "111234567",
+        "800123456",
+        "970123456",
+        "992351000",
+        "999999999",
+        "776000000",
+        "20100000a",
+        "２０１０００００１",
+        True,
+        None,
+        2.01e8,
+        [201000001],
+        {"m": 1},
+        -201000001,
+    ],
+)
 def test_invalid_mmsis_dropped(bad):
     t = live_tracker()
     assert valid_mmsi(bad) is None
@@ -235,19 +269,22 @@ def test_valid_mmsis_accepted(good):
     assert valid_mmsi(good) == str(good)
 
 
-@pytest.mark.parametrize("lat,lon", [
-    (25.0, 56.3),        # south of the box (Fujairah anchorage)
-    (27.2, 56.3),        # Bandar Abbas
-    (26.5, 55.0),        # inside the Gulf
-    (26.5, 58.0),        # Gulf of Oman
-    (91.0, 181.0),       # AIS "not available"
-    (0.0, 0.0),          # null island
-    (float("nan"), 56.3),
-    (26.5, float("inf")),
-    ("26.5", "56.3"),
-    (None, None),
-    (True, True),
-])
+@pytest.mark.parametrize(
+    "lat,lon",
+    [
+        (25.0, 56.3),  # south of the box (Fujairah anchorage)
+        (27.2, 56.3),  # Bandar Abbas
+        (26.5, 55.0),  # inside the Gulf
+        (26.5, 58.0),  # Gulf of Oman
+        (91.0, 181.0),  # AIS "not available"
+        (0.0, 0.0),  # null island
+        (float("nan"), 56.3),
+        (26.5, float("inf")),
+        ("26.5", "56.3"),
+        (None, None),
+        (True, True),
+    ],
+)
 def test_out_of_area_or_malformed_positions_dropped(lat, lon):
     t = live_tracker()
     assert t.position("636019825", lat, lon, T0) is False
@@ -266,14 +303,17 @@ def test_markup_in_names_is_kept_as_short_plain_text():
     assert ship.name == '<SCRIPT>ALERT("X")</'  # inert text; the renderer escapes it
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("EXAMPLE TANKER@@@@@@", "EXAMPLE TANKER"),
-    ("  padded   ", "PADDED"),
-    ("x" * 10_000, "X" * NAME_MAX),
-    ("\u0000\u0007bell", "BELL"),
-    (12345, ""),
-    (None, ""),
-])
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("EXAMPLE TANKER@@@@@@", "EXAMPLE TANKER"),
+        ("  padded   ", "PADDED"),
+        ("x" * 10_000, "X" * NAME_MAX),
+        ("\u0000\u0007bell", "BELL"),
+        (12345, ""),
+        (None, ""),
+    ],
+)
 def test_clean_name(raw, expected):
     assert clean_name(raw) == expected
 
@@ -291,8 +331,12 @@ def test_bad_static_fields_ignored():
 def test_flood_of_ships_stays_bounded():
     t = live_tracker()
     for i in range(50_000):
-        t.position(f"{201000000 + i}", 26.0 + (i % 100) / 100, 56.0 + (i % 97) / 100,
-                   T0 + timedelta(microseconds=i))
+        t.position(
+            f"{201000000 + i}",
+            26.0 + (i % 100) / 100,
+            56.0 + (i % 97) / 100,
+            T0 + timedelta(microseconds=i),
+        )
         t.static(f"{201000000 + i}", 80, "<b>FLOOD</b>" * 100, T0 + timedelta(microseconds=i))
     assert len(t) == 5000
     snap = t.snapshot(T0 + MIN)

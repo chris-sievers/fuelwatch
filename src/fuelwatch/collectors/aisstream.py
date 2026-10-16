@@ -61,14 +61,42 @@ STABLE_AFTER = 60.0  # a connection that lasted this long resets the backoff
 _GRACE = timedelta(hours=1)
 _SCHEDULE = "every 10 minutes while connected"
 SERIES = [
-    SeriesSpec(SERIES_SHIPS, "Ships broadcasting AIS in the strait", "ships", "AISStream",
-               Frequency.TEN_MINUTES, _SCHEDULE, _GRACE),
-    SeriesSpec(SERIES_TANKERS, "Tankers broadcasting AIS in the strait", "ships", "AISStream",
-               Frequency.TEN_MINUTES, _SCHEDULE, _GRACE),
-    SeriesSpec(SERIES_CROSSINGS, "Ships crossing the strait (live AIS)", "ships", "AISStream",
-               Frequency.TEN_MINUTES, _SCHEDULE, _GRACE),
-    SeriesSpec(SERIES_TANKER_CROSSINGS, "Tankers crossing the strait (live AIS)", "ships",
-               "AISStream", Frequency.TEN_MINUTES, _SCHEDULE, _GRACE),
+    SeriesSpec(
+        SERIES_SHIPS,
+        "Ships broadcasting AIS in the strait",
+        "ships",
+        "AISStream",
+        Frequency.TEN_MINUTES,
+        _SCHEDULE,
+        _GRACE,
+    ),
+    SeriesSpec(
+        SERIES_TANKERS,
+        "Tankers broadcasting AIS in the strait",
+        "ships",
+        "AISStream",
+        Frequency.TEN_MINUTES,
+        _SCHEDULE,
+        _GRACE,
+    ),
+    SeriesSpec(
+        SERIES_CROSSINGS,
+        "Ships crossing the strait (live AIS)",
+        "ships",
+        "AISStream",
+        Frequency.TEN_MINUTES,
+        _SCHEDULE,
+        _GRACE,
+    ),
+    SeriesSpec(
+        SERIES_TANKER_CROSSINGS,
+        "Tankers crossing the strait (live AIS)",
+        "ships",
+        "AISStream",
+        Frequency.TEN_MINUTES,
+        _SCHEDULE,
+        _GRACE,
+    ),
 ]
 
 
