@@ -37,8 +37,13 @@ DOVER = [[50.8, 1.0], [51.2, 1.8]]
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "aisstream"
 
 POSITION_FIELDS = {
-    "UserID": int, "Valid": bool, "Latitude": (int, float), "Longitude": (int, float),
-    "Sog": (int, float), "Cog": (int, float), "TrueHeading": int,
+    "UserID": int,
+    "Valid": bool,
+    "Latitude": (int, float),
+    "Longitude": (int, float),
+    "Sog": (int, float),
+    "Cog": (int, float),
+    "TrueHeading": int,
 }
 STATIC_FIELDS = {"UserID": int, "Valid": bool, "Name": str, "Type": int}
 
@@ -57,11 +62,15 @@ async def _session(key: str) -> dict:
     hormuz_positions = 0
     deadline = time.monotonic() + SESSION_SECONDS
     async with connect(URL, compression="deflate", open_timeout=10) as ws:
-        await ws.send(json.dumps({
-            "APIKey": key,
-            "BoundingBoxes": [HORMUZ_BBOX.to_aisstream(), DOVER],
-            "FilterMessageTypes": MESSAGE_TYPES,
-        }))
+        await ws.send(
+            json.dumps(
+                {
+                    "APIKey": key,
+                    "BoundingBoxes": [HORMUZ_BBOX.to_aisstream(), DOVER],
+                    "FilterMessageTypes": MESSAGE_TYPES,
+                }
+            )
+        )
         while time.monotonic() < deadline:
             try:
                 raw = await asyncio.wait_for(ws.recv(), deadline - time.monotonic())
@@ -72,7 +81,9 @@ async def _session(key: str) -> dict:
             doc = json.loads(raw)
             mtype = doc.get("MessageType")
             if mtype not in MESSAGE_TYPES:
-                other_types.add(str(mtype))
+                # The server acknowledges each subscription before data flows.
+                if mtype != "SubscriptionConfirmation":
+                    other_types.add(str(mtype))
                 continue
             assert {"MessageType", "MetaData", "Message"} <= doc.keys(), sorted(doc)
             assert isinstance(doc["Message"].get(mtype), dict)
@@ -83,8 +94,13 @@ async def _session(key: str) -> dict:
                 hormuz_positions += apply(tracker, msg, datetime.now(UTC))
             elif isinstance(msg, StaticMsg):
                 apply(tracker, msg, datetime.now(UTC))
-    return {"found": found, "raw": raw_first, "other": other_types,
-            "hormuz": hormuz_positions, "tracker": tracker}
+    return {
+        "found": found,
+        "raw": raw_first,
+        "other": other_types,
+        "hormuz": hormuz_positions,
+        "tracker": tracker,
+    }
 
 
 @pytest.mark.contract
@@ -112,12 +128,15 @@ async def test_aisstream_message_shape():
 
     assert not result["other"], f"unsubscribed message types arrived: {result['other']}"
 
-    print(f"Hormuz positions accepted: {result['hormuz']}; "
-          f"ships tracked: {len(result['tracker'].snapshot(datetime.now(UTC)))}; "
-          f"MetaData keys: {sorted(pos_doc['MetaData'])}")
+    print(
+        f"Hormuz positions accepted: {result['hormuz']}; "
+        f"ships tracked: {len(result['tracker'].snapshot(datetime.now(UTC)))}; "
+        f"MetaData keys: {sorted(pos_doc['MetaData'])}"
+    )
 
     if os.environ.get("FW_RECORD_FIXTURES") == "1":
         for mtype, raw in result["raw"].items():
             text = raw.decode() if isinstance(raw, bytes) else raw
             (FIXTURES / f"recorded_{mtype}.json").write_text(
-                json.dumps(json.loads(text), indent=2) + "\n")
+                json.dumps(json.loads(text), indent=2) + "\n"
+            )

@@ -1,0 +1,32 @@
+{
+  "MetaData": {
+    "MMSI": 352002605,
+    "MMSI_String": 352002605,
+    "ShipName": "LOWLANDS SKY        ",
+    "latitude": 50.97921,
+    "longitude": 1.53484,
+    "time_utc": "2026-10-16 18:40:15.819348411 +0000 UTC"
+  },
+  "MessageType": "PositionReport",
+  "Message": {
+    "PositionReport": {
+      "MessageID": 1,
+      "RepeatIndicator": 0,
+      "UserID": 352002605,
+      "Valid": true,
+      "NavigationalStatus": 0,
+      "RateOfTurn": 0,
+      "Sog": 12.1,
+      "PositionAccuracy": true,
+      "Longitude": 1.5348366666666666,
+      "Latitude": 50.979205,
+      "Cog": 47.1,
+      "TrueHeading": 47,
+      "Timestamp": 15,
+      "SpecialManoeuvreIndicator": 0,
+      "Spare": 0,
+      "Raim": false,
+      "CommunicationState": 25760
+    }
+  }
+}

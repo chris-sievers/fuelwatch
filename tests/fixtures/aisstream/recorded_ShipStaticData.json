@@ -1,0 +1,41 @@
+{
+  "MetaData": {
+    "MMSI": 422221000,
+    "MMSI_String": 422221000,
+    "ShipName": "HASNA   ",
+    "latitude": 26.96056,
+    "longitude": 56.47924,
+    "time_utc": "2026-10-16 18:40:43.105228823 +0000 UTC"
+  },
+  "MessageType": "ShipStaticData",
+  "Message": {
+    "ShipStaticData": {
+      "AisVersion": 2,
+      "CallSign": "EPA3011",
+      "Destination": "TO ORDER",
+      "Dimension": {
+        "A": 280,
+        "B": 53,
+        "C": 29,
+        "D": 29
+      },
+      "Dte": false,
+      "Eta": {
+        "Day": 0,
+        "Hour": 24,
+        "Minute": 60,
+        "Month": 0
+      },
+      "FixType": 15,
+      "ImoNumber": 0,
+      "MaximumStaticDraught": 11.5,
+      "MessageID": 5,
+      "Name": "HASNA   ",
+      "RepeatIndicator": 0,
+      "Spare": false,
+      "Type": 80,
+      "UserID": 422221000,
+      "Valid": true
+    }
+  }
+}
