@@ -44,7 +44,9 @@ def test_parse_position_report_fixture():
 
 def test_parse_ship_static_data_fixture():
     msg = parse_frame(fixture("ship_static_data.json"))
-    assert msg == StaticMsg(mmsi=636019825, ship_type=80, name="EXAMPLE TANKER@@@@@@")
+    assert msg == StaticMsg(
+        mmsi=636019825, ship_type=80, name="EXAMPLE TANKER@@@@@@", lat=26.6, lon=56.25
+    )
 
 
 def test_parse_confirmation_and_text_frames():
@@ -90,7 +92,8 @@ def test_subscription_message_shape():
     sub = json.loads(subscription(KEY))
     assert sub == {
         "APIKey": KEY,
-        "BoundingBoxes": [[[25.9, 55.9], [27.0, 57.0]]],
+        # Hormuz, plus the Persian Gulf and Gulf of Oman as the feed heartbeat
+        "BoundingBoxes": [[[25.9, 55.9], [27.0, 57.0]], [[22.0, 48.0], [30.5, 60.5]]],
         "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
     }
 
@@ -234,6 +237,7 @@ async def test_ticker_emits_only_covered_slots_and_never_zeros():
     t.connected(clock.t)
     c = AisStreamCollector(KEY, tracker=t, clock=clock, sleep=sleep)
     c._ws = FakeWS([])  # a healthy socket answers the slot-end ping
+    c._feed = {T0 + timedelta(minutes=m): 50 for m in range(0, 60, 10)}  # the feed is busy
     await c._tick(sink, stop)
 
     ends = [pts[0].period_end for pts in emitted]
@@ -276,29 +280,71 @@ async def test_run_stops_promptly_while_socket_is_quiet():
     assert len(c.snapshot()) == 1  # positions stay on the map until they expire
 
 
-# --- liveness: keepalive pings, not message silence ------------------------------------
+# --- liveness: keepalive pings and feed traffic, not Hormuz silence --------------------
+
+GULF = (29.0, 49.5)  # in the Persian Gulf feed box, far outside the Hormuz box
+GULF_MMSI = 422000001
+
+
+def pos_frame(mmsi, lat, lon) -> bytes:
+    doc = json.loads(fixture("position_report.json"))
+    doc["MetaData"].update(MMSI=mmsi, MMSI_String=mmsi, latitude=lat, longitude=lon)
+    doc["Message"]["PositionReport"].update(UserID=mmsi, Latitude=lat, Longitude=lon)
+    return json.dumps(doc).encode()
+
+
+def static_frame(mmsi, lat, lon, ship_type=80) -> bytes:
+    doc = json.loads(fixture("ship_static_data.json"))
+    doc["MetaData"].update(MMSI=mmsi, MMSI_String=mmsi, latitude=lat, longitude=lon)
+    doc["Message"]["ShipStaticData"].update(UserID=mmsi, Type=ship_type)
+    return json.dumps(doc).encode()
 
 
 class QuietWS(FakeWS):
-    """Delivers its frames, then stays silent until `die` is set, when it
-    fails the way websockets does after a keepalive ping times out."""
+    """Delivers frames as the test pushes them and stays silent in between,
+    like a quiet but healthy socket. `kill()` makes it fail the way
+    websockets does after a keepalive ping times out."""
 
     def __init__(self, frames, **kw):
         super().__init__(frames, **kw)
-        self.die = asyncio.Event()
+        self.wake = asyncio.Event()
+        self.dead = False
+
+    def push(self, *frames):
+        self.frames.extend(frames)
+        self.wake.set()
+
+    def kill(self):
+        self.dead = True
+        self.wake.set()
 
     async def recv(self):
         await asyncio.sleep(0)
-        if self.frames:
-            return self.frames.pop(0)
-        await self.die.wait()
-        raise ConnectionClosedError(None, None)
+        while not self.frames:
+            if self.dead:
+                raise ConnectionClosedError(None, None)
+            self.wake.clear()
+            await self.wake.wait()
+        return self.frames.pop(0)
+
+
+async def settle():
+    for _ in range(20):
+        await asyncio.sleep(0)  # let the stream task take what was pushed
+
+
+async def gulf_traffic(ws, clock, boundary):
+    """Mid-slot traffic from the wide box only: the feed is alive, Hormuz is quiet."""
+    clock.t = boundary - timedelta(minutes=5)
+    ws.push(pos_frame(GULF_MMSI, *GULF), static_frame(GULF_MMSI, *GULF))
+    await settle()
 
 
 def scripted_run(sockets, clock, on_tick, *, stop_after):
-    """A collector whose ticker sleeps advance the fake clock. `on_tick(t)`
-    runs before the clock moves to boundary t; reconnect backoff sleeps just
-    yield. Stops after `stop_after` sink calls."""
+    """A collector whose ticker sleeps move the fake clock to each boundary.
+    `on_tick(t)` runs just before the clock reaches boundary t and may move
+    the clock within the slot; reconnect backoff sleeps just yield. Stops
+    after `stop_after` sink calls."""
     stop = asyncio.Event()
     emitted = []
     connects = []
@@ -310,13 +356,13 @@ def scripted_run(sockets, clock, on_tick, *, stop_after):
         return ws
 
     async def sleep(d):
-        for _ in range(5):
-            await asyncio.sleep(0)  # let the stream task catch up
+        await settle()
         if d < 30:  # reconnect backoff
             clock.t += timedelta(seconds=d)
             return
-        await on_tick(clock.t + timedelta(seconds=d))
-        clock.t += timedelta(seconds=d)
+        target = clock.t + timedelta(seconds=d)
+        await on_tick(target)
+        clock.t = target
 
     async def sink(points):
         emitted.append(points)
@@ -327,13 +373,14 @@ def scripted_run(sockets, clock, on_tick, *, stop_after):
     return c, sink, stop, emitted, connects
 
 
-async def test_quiet_connection_covers_its_slots_and_emits_zeros():
-    # Subscription confirmed at 11:58, then nothing at all for 30 minutes.
+async def test_quiet_hormuz_with_live_feed_emits_real_zeros():
+    # Confirmed at 11:58; then only Persian Gulf traffic, nothing at Hormuz.
     ws = QuietWS([fixture("subscription_confirmation.json")])
     clock = Clock(T0 - timedelta(minutes=2))
 
     async def on_tick(boundary):
-        pass
+        if boundary > T0:
+            await gulf_traffic(ws, clock, boundary)
 
     c, sink, stop, emitted, connects = scripted_run([ws], clock, on_tick, stop_after=3)
     await asyncio.wait_for(c.run(sink, stop), timeout=5)
@@ -347,21 +394,81 @@ async def test_quiet_connection_covers_its_slots_and_emits_zeros():
     assert len(connects) == 1 and c.status.reconnects == 0  # silence never reconnects
     assert ws.pings == 3  # each emitted slot was confirmed by a pong
     assert c.status.error_class is None
-    # a long silence is surfaced in status, not acted on
-    assert "no AIS messages for 32 minutes" in c.status.note
+    # the Gulf ship never reached the Hormuz tracker
+    assert len(c.tracker) == 0 and c.snapshot() == ()
+
+
+async def test_healthy_socket_with_stalled_feed_emits_nothing_and_says_so():
+    # The socket answers every ping, but AISStream sends no data at all
+    # for 12:00-12:20. Then the feed comes back.
+    ws = QuietWS([fixture("subscription_confirmation.json")])
+    clock = Clock(T0 - timedelta(minutes=2))
+    seen = {}
+    box = []
+
+    async def on_tick(boundary):
+        if box:
+            seen[boundary] = (box[0].status.error_class, box[0].status.message)
+        if boundary == T0 + timedelta(minutes=30):
+            await gulf_traffic(ws, clock, boundary)
+
+    c, sink, stop, emitted, connects = scripted_run([ws], clock, on_tick, stop_after=1)
+    box.append(c)
+    await asyncio.wait_for(c.run(sink, stop), timeout=5)
+
+    # 12:10 and 12:20 had a healthy socket but no feed: no points, not zeros.
+    assert [pts[0].period_end for pts in emitted] == [T0 + timedelta(minutes=30)]
+    error_class, message = seen[T0 + timedelta(minutes=30)]  # status after the 12:20 slot
+    assert error_class == "feed_stalled"
+    assert "0 AIS messages" in message and "12:20 UTC" in message
+    assert c.status.error_class is None and c.status.message is None  # cleared on recovery
+    assert len(connects) == 1 and c.status.reconnects == 0
+
+
+def test_wide_box_ships_never_enter_the_hormuz_tracker():
+    t = Tracker(max_ships=3)
+    assert apply(t, parse_frame(pos_frame(636019825, 26.6, 56.35)), T0)  # a Hormuz ship
+    for i in range(10):  # a flood of Gulf ships, positions and static data
+        mmsi = GULF_MMSI + i
+        assert not apply(t, parse_frame(pos_frame(mmsi, *GULF)), T0)
+        assert not apply(t, parse_frame(static_frame(mmsi, *GULF)), T0)
+    assert len(t) == 1  # no wide-box ship in the table or against the cap
+    assert [s.mmsi for s in t.snapshot(T0)] == ["636019825"]
+    # static data still lands for a tracked ship, wherever MetaData puts it ...
+    assert apply(t, parse_frame(static_frame(636019825, *GULF)), T0)
+    assert t.snapshot(T0)[0].tanker
+    # ... and for an untracked ship whose MetaData position is in the box
+    assert apply(t, parse_frame(static_frame(422000999, 26.5, 56.5)), T0)
+    # static data with a missing or junk position is dropped for unknown ships
+    assert not apply(t, StaticMsg(422000998, 80, "X", lat=None, lon=None), T0)
+    assert not apply(t, StaticMsg(422000997, 80, "X", lat=float("nan"), lon=56.5), T0)
+    assert not apply(t, StaticMsg(422000996, 80, "X", lat=True, lon=56.5), T0)
+
+
+def test_wide_box_ships_never_reach_hormuz_counts():
+    t = Tracker()
+    t.connected(T0 - timedelta(minutes=1))
+    for i in range(50):
+        apply(t, parse_frame(pos_frame(GULF_MMSI + i, *GULF)), T0 + timedelta(minutes=1))
+    apply(t, parse_frame(pos_frame(636019825, 26.6, 56.35)), T0 + timedelta(minutes=2))
+    counts = {p.series: p.value for p in t.close_slot(T0 + timedelta(minutes=10))}
+    assert counts[SERIES_SHIPS] == 1
 
 
 async def test_failed_keepalive_reconnects_and_drops_the_slot():
     ws1 = QuietWS([fixture("subscription_confirmation.json")])
     ws2 = QuietWS([fixture("subscription_confirmation.json")])
     clock = Clock(T0 - timedelta(minutes=2))
+    live = [ws1]
 
     async def on_tick(boundary):
         if boundary == T0 + timedelta(minutes=20):
             clock.t = T0 + timedelta(minutes=15)  # keepalive ping times out at 12:15
-            ws1.die.set()
-            for _ in range(20):
-                await asyncio.sleep(0)  # fail, back off, reconnect, confirm
+            ws1.kill()
+            live[0] = ws2
+            await settle()  # fail, back off, reconnect, confirm
+        if boundary > T0:
+            await gulf_traffic(live[0], clock, boundary)
 
     c, sink, stop, emitted, connects = scripted_run([ws1, ws2], clock, on_tick, stop_after=2)
     await asyncio.wait_for(c.run(sink, stop), timeout=5)
@@ -375,10 +482,9 @@ async def test_failed_keepalive_reconnects_and_drops_the_slot():
     assert connects == [ws1, ws2] and c.status.reconnects == 1
 
 
-async def test_unanswered_slot_end_ping_drops_the_slot(monkeypatch):
-    # The peer is gone but the keepalive has not noticed yet: the ping sent
-    # at the slot end gets no pong, so the slot is not emitted.
-    monkeypatch.setattr(aisstream, "PING_TIMEOUT", 0.01)
+async def tick_one_slot(ws_factory):
+    """Run the ticker over the 12:00-12:10 slot, which the tracker covered and
+    the feed had traffic in; only the slot-end ping decides it."""
     t = Tracker()
     t.connected(T0 - timedelta(minutes=1))
     t.position("636019825", 26.6, 56.35, T0 + timedelta(minutes=1))
@@ -388,34 +494,97 @@ async def test_unanswered_slot_end_ping_drops_the_slot(monkeypatch):
 
     async def sleep(d):
         clock.t += timedelta(seconds=d)
-        if clock.t >= T0 + timedelta(minutes=20):
+        if clock.t >= T0 + timedelta(minutes=10):
             stop.set()
 
     async def sink(points):
         emitted.append(points)
 
     c = AisStreamCollector(KEY, tracker=t, clock=clock, sleep=sleep)
-    c._ws = FakeWS([], pong=False)
-    await c._tick(sink, stop)
+    c._feed = {T0: 50}
+    c._ws = ws_factory(c)
+    await asyncio.wait_for(c._tick(sink, stop), timeout=2)
+    return c, emitted
+
+
+async def test_answered_slot_end_ping_emits_the_slot():
+    c, emitted = await tick_one_slot(lambda c: FakeWS([]))
+    assert len(emitted) == 1 and c._ws.pings == 1
+
+
+async def test_unanswered_slot_end_ping_drops_the_slot(monkeypatch):
+    # The peer is gone but the keepalive has not noticed yet: no pong.
+    monkeypatch.setattr(aisstream, "PING_TIMEOUT", 0.01)
+    c, emitted = await tick_one_slot(lambda c: FakeWS([], pong=False))
+    assert emitted == [] and c._ws.pings == 1
+
+
+async def test_ping_send_that_blocks_is_under_the_same_timeout(monkeypatch):
+    # Sending the ping itself can block (paused transport, closing socket).
+    monkeypatch.setattr(aisstream, "PING_TIMEOUT", 0.01)
+
+    class BlockedWS(FakeWS):
+        async def ping(self):
+            await asyncio.Event().wait()
+
+    _, emitted = await tick_one_slot(lambda c: BlockedWS([]))
     assert emitted == []
-    assert c._ws.pings == 2
+
+
+async def test_pong_waiter_raising_connection_closed_drops_the_slot():
+    class ClosingWS(FakeWS):
+        async def ping(self):
+            waiter = asyncio.get_running_loop().create_future()
+            waiter.set_exception(ConnectionClosedError(None, None))
+            return waiter
+
+    _, emitted = await tick_one_slot(lambda c: ClosingWS([]))
+    assert emitted == []
+
+
+async def test_reconnect_while_ping_in_flight_drops_the_slot():
+    # The old socket dies and a new session is already live when the pong
+    # resolves: the pong is not evidence for the slot, so it is dropped.
+    class SwappedWS(FakeWS):
+        def __init__(self, c):
+            super().__init__([])
+            self.c = c
+
+        async def ping(self):
+            waiter = asyncio.get_running_loop().create_future()
+            now = self.c._clock()
+            self.c.tracker.disconnected(now)
+            self.c.tracker.connected(now)  # outage starts after the slot end
+            self.c._ws = FakeWS([])
+            waiter.set_result(0.0)
+            return waiter
+
+    c, emitted = await tick_one_slot(SwappedWS)
+    assert c.tracker.live  # only the socket identity check catches this
+    assert emitted == []
+
+
+async def test_ticker_crash_ends_run_with_the_error():
+    class BrokenPingWS(QuietWS):
+        async def ping(self):
+            raise RuntimeError("websockets changed")
+
+    ws = BrokenPingWS([fixture("subscription_confirmation.json")])
+    clock = Clock(T0 - timedelta(minutes=2))
+
+    async def on_tick(boundary):
+        if boundary > T0:
+            await gulf_traffic(ws, clock, boundary)
+
+    c, sink, stop, _, _ = scripted_run([ws], clock, on_tick, stop_after=1)
+    with pytest.raises(RuntimeError, match="websockets changed"):
+        await asyncio.wait_for(c.run(sink, stop), timeout=5)
+    assert c.status.error_class == "internal"
+    assert c.status.message.startswith("ticker failed: RuntimeError")
+    assert not c.status.connected and not c.tracker.live
 
 
 async def test_no_live_socket_means_no_slot():
     # Even if the tracker thinks it is live, a slot needs a socket to confirm it.
-    t = Tracker()
-    t.connected(T0 - timedelta(minutes=1))
-    clock = Clock(T0 + timedelta(minutes=5))
-    stop = asyncio.Event()
-    emitted = []
-
-    async def sleep(d):
-        clock.t += timedelta(seconds=d)
-        stop.set()
-
-    async def sink(points):
-        emitted.append(points)
-
-    c = AisStreamCollector(KEY, tracker=t, clock=clock, sleep=sleep)
-    await c._tick(sink, stop)
+    _, emitted = await tick_one_slot(lambda c: None)
     assert emitted == []

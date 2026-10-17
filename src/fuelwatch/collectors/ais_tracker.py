@@ -253,6 +253,11 @@ class Tracker:
 
     # ingest
 
+    def knows(self, mmsi: object) -> bool:
+        """True if this MMSI is in the table (heard in the box recently)."""
+        key = valid_mmsi(mmsi)
+        return key is not None and key in self._ships
+
     def _touch(self, mmsi: str, now: datetime) -> _Ship:
         ship = self._ships.get(mmsi)
         if ship is None:
