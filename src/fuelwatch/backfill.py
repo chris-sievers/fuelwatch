@@ -20,13 +20,32 @@ state never sits at "running" while nothing runs; ``run`` retries it later
 with a doubling delay. The scheduler starts polling a collector whose
 backfill has failed, so recent data keeps arriving while history waits.
 
-A full fetch that leaves any registered series without a point, or returns
-fewer than MIN_POINTS_PER_SERIES points per series on average, is treated
-as a failure, not done. Five years
-of the sparsest series (weekly) is about 260 points per series, so less
-than one year's worth means an outage or a truncated answer, and marking it
-done would leave the history missing for good (polls only fetch recent
-weeks). A resumed fetch must return at least one point (the cursor's day).
+Plausibility is judged after the points are written, so good history is
+never thrown away:
+
+- a full fetch with no points at all is a failure (not_started, as above);
+- if every registered series now has data and the fetch averaged at least
+  MIN_POINTS_PER_SERIES points per series, the collector is done;
+- otherwise it is **partial**: the history that came back is kept, polls
+  run normally, the missing series are named in status, and ``run`` retries
+  a full fetch with a delay doubling from PARTIAL_RETRY_START to
+  PARTIAL_RETRY_MAX (24 h: it is a heavy refetch). A series that a provider
+  really retired keeps the collector partial until an operator runs
+  ``fuelwatch backfill --only NAME --accept-missing``, which marks it done
+  and keeps the missing list. Freshness still shows those series as
+  no_data, so the dashboard and alerts keep pointing at them.
+
+Five years of the sparsest series (weekly) is about 260 points per series,
+so an average below one year's worth (52) means a truncated answer. A
+resumed fetch must return at least one point (the cursor's day).
+
+The store's backfill_state column allows only not_started, running and
+done (a CHECK constraint; widening it would need a table rebuild, which the
+additive-only migrations forbid, and would break a rolled-back image that
+reads the row). So "partial" is state done plus a JSON cursor, which the
+store treats as opaque text: ``{"partial": {"attempt": n, "missing": [...],
+"points": n, "need": n}}``, or ``{"accepted_missing": [...]}`` once accepted.
+Read it through ``summary()`` or ``partial_info()``.
 
 Nothing here blocks the event loop: the collectors parse in worker threads
 and every store call goes through a worker thread (``ThreadCalls``).
@@ -40,6 +59,7 @@ spaced two seconds apart (IMF asks for paced automated download), and one
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 from collections.abc import Callable, Iterable
@@ -61,7 +81,8 @@ CHUNK = 2000  # points per upsert transaction
 RETRY_START = 60.0  # seconds before retrying a failed collector, doubling
 RETRY_MAX = 6 * 3600.0
 MIN_POINTS_PER_SERIES = 52  # one year of weekly data; see the module docstring
-REQUIRE_EVERY_SERIES = True  # a full fetch must cover every registered series
+PARTIAL_RETRY_START = 3600.0  # seconds before re-fetching a partial collector, doubling
+PARTIAL_RETRY_MAX = 24 * 3600.0
 
 # Minimum seconds between requests to one host.
 PACING = {
@@ -76,8 +97,14 @@ class Result:
     collector: str
     state: BackfillState
     rows: int = 0  # points written by this run
-    skipped: bool = False  # already done
+    skipped: bool = False  # already done (or partial and not due for a retry)
     error: str | None = None  # sanitized
+    missing: tuple[str, ...] = ()  # partial: registered series with no data
+    retry_in: float | None = None  # partial: seconds until the next full fetch
+
+    @property
+    def partial(self) -> bool:
+        return self.state == BackfillState.DONE and bool(self.missing or self.retry_in)
 
 
 def paced(client: httpx.AsyncClient | PacedClient) -> PacedClient:
@@ -98,45 +125,37 @@ def _sorted(points: list[Point]) -> list[Point]:
     return sorted(points, key=lambda p: (p.period_end, p.series))
 
 
-def check_plausible(collector: Collector, points: list[Point], since: date | None) -> None:
-    """Raise ProviderError unless the fetch looks like real history.
+def partial_info(cursor: str | None) -> dict | None:
+    """The JSON marker a done collector's cursor holds when its backfill is
+    partial or its missing series were accepted; None otherwise."""
+    if not cursor or not cursor.startswith("{"):
+        return None
+    try:
+        info = json.loads(cursor)
+    except ValueError:
+        return None
+    return info if isinstance(info, dict) else None
 
-    A full fetch must have at least one point for every registered series
-    (an outage that empties one EIA route still leaves the others' points,
-    which alone would pass the average) and at least MIN_POINTS_PER_SERIES
-    per series on average."""
-    if since is not None:
-        if not points:
-            raise ProviderError("empty", f"{collector.name}: no points since {since}")
-        return
-    if REQUIRE_EVERY_SERIES:
-        missing = sorted({s.id for s in collector.series} - {p.series for p in points})
-        if missing:
-            shown = ", ".join(missing[:5]) + (
-                f" and {len(missing) - 5} more" if len(missing) > 5 else ""
-            )
-            raise ProviderError(
-                "implausible",
-                f"{collector.name}: backfill returned no points for "
-                f"{len(missing)} of {len(collector.series)} series: {shown}",
-            )
-    need = MIN_POINTS_PER_SERIES * len(collector.series)
-    if len(points) < need:
-        raise ProviderError(
-            "implausible",
-            f"{collector.name}: backfill returned {len(points)} points for "
-            f"{len(collector.series)} series, expected at least {need}",
-        )
+
+def partial_delay(attempt: int) -> float:
+    return min(PARTIAL_RETRY_START * 2 ** min(max(0, attempt - 1), 20), PARTIAL_RETRY_MAX)
+
+
+def _names(ids: Iterable[str], limit: int = 10) -> str:
+    ids = list(ids)
+    shown = ", ".join(ids[:limit])
+    return shown + (f" and {len(ids) - limit} more" if len(ids) > limit else "")
 
 
 class FailureLog:
     """Logs failures without flooding: a provider error is a warning with
     its sanitized message; an internal error logs its (redacted) traceback
     at ERROR the first time in a row for a key, then the type only, until
-    ``recovered(key)``."""
+    ``recovered(key)``. One per Scheduler (or per ``run``), so its state
+    never leaks between instances."""
 
-    def __init__(self, logger: logging.Logger) -> None:
-        self._log = logger
+    def __init__(self, logger: logging.Logger | None = None) -> None:
+        self._log = logger or log
         self._seen: set[str] = set()
 
     def report(self, key: str, what: str, e: BaseException) -> None:
@@ -152,9 +171,6 @@ class FailureLog:
 
     def recovered(self, key: str) -> None:
         self._seen.discard(key)
-
-
-failures = FailureLog(log)
 
 
 async def unless_stopped(aw, stop: asyncio.Event | None):
@@ -194,27 +210,48 @@ async def backfill_collector(
     now: Callable[[], datetime] = _utcnow,
     stop: asyncio.Event | None = None,
     io: ThreadCalls | None = None,
+    flog: FailureLog | None = None,
 ) -> Result:
-    """Backfill one collector, or skip it if done. Never raises except on
-    cancellation: any failure, the store's included, is logged sanitized,
-    recorded when the store allows, and returned."""
+    """Backfill one collector, skip it if done, or re-fetch it if it is
+    partial and due. Never raises except on cancellation: any failure, the
+    store's included, is logged sanitized, recorded when the store allows,
+    and returned."""
     io = io or ThreadCalls()
+    flog = flog or FailureLog()
     name = collector.name
     written = 0
     cursor: str | None = None
     progress = 0.0
+    retry: dict | None = None  # the partial marker, when re-fetching a partial collector
     try:
         bf = await io(store.get_backfill, name)
+        info = partial_info(bf.cursor)
         if bf.state == BackfillState.DONE:
-            return Result(name, bf.state, skipped=True)
-        cursor, progress = bf.cursor, bf.progress
-        since = date.fromisoformat(cursor) if cursor else None
+            if info is None or "partial" not in info:
+                return Result(name, bf.state, skipped=True)
+            retry = info["partial"]
+            due = (bf.updated_at or now()) + timedelta(seconds=partial_delay(retry["attempt"]))
+            if now() < due:
+                left = (due - now()).total_seconds()
+                return Result(
+                    name, bf.state, skipped=True, missing=tuple(retry["missing"]), retry_in=left
+                )
+            since = None
+        else:
+            cursor, progress = bf.cursor, bf.progress
+            since = date.fromisoformat(cursor) if cursor and info is None else None
         today = now().date()
         start_progress = _progress(since, today) if since else 0.0
-        await io(store.set_backfill, name, BackfillState.RUNNING, cursor, start_progress)
-        log.info("backfill %s: fetching %s", name, f"since {since}" if since else "five years")
+        if retry is None:
+            await io(store.set_backfill, name, BackfillState.RUNNING, cursor, start_progress)
+        what = f"since {since}" if since else "five years"
+        log.info("backfill %s: fetching %s%s", name, what, " (partial retry)" if retry else "")
         points = await unless_stopped(collector.fetch(client, since), stop)
-        check_plausible(collector, points, since)
+        if not points:
+            if since is not None:
+                raise ProviderError("empty", f"{name}: no points since {since}")
+            if retry is None:
+                raise ProviderError("empty", f"{name}: backfill returned no points")
         points = await io(_sorted, points)
         for i in range(0, len(points), CHUNK):
             if stop is not None and stop.is_set():
@@ -222,42 +259,108 @@ async def backfill_collector(
             chunk = points[i : i + CHUNK]
             await io(store.upsert_points, chunk)
             written += len(chunk)
-            cursor = chunk[-1].period_end.date().isoformat()
-            progress = max(start_progress, _progress(date.fromisoformat(cursor), today))
-            await io(store.set_backfill, name, BackfillState.RUNNING, cursor, progress)
+            if retry is None:  # a partial re-fetch leaves the done state alone
+                cursor = chunk[-1].period_end.date().isoformat()
+                progress = max(start_progress, _progress(date.fromisoformat(cursor), today))
+                await io(store.set_backfill, name, BackfillState.RUNNING, cursor, progress)
+        # Judge only now, with the points safely stored.
+        stored = await io(store.series_latest)
+        ids = [s.id for s in collector.series]
+        fetched = {p.series for p in points}
+        missing = tuple(sorted(i for i in ids if i not in fetched and i not in stored))
+        need = MIN_POINTS_PER_SERIES * len(ids)
+        short = since is None and len(points) < need
+        if missing or short:
+            return await _record_partial(
+                store, io, flog, collector, missing, len(points), need, retry, written
+            )
         await io(store.set_backfill, name, BackfillState.DONE, cursor, 1.0)
         await io(store.record_success, name)
     except asyncio.CancelledError:
         raise
     except Stopped:
         return Result(name, BackfillState.RUNNING, written)  # resumes on the next start
-    except Exception as e:  # noqa: BLE001 - logged by failures.report, recorded, returned
+    except Exception as e:  # noqa: BLE001 - logged by FailureLog, recorded, returned
         if is_store_closed(e):
             log.debug("backfill %s: store closed, stopping", name)
             return Result(name, BackfillState.RUNNING, written)
         msg = _message(e)
-        failures.report(f"backfill:{name}", f"backfill {name}", e)
+        flog.report(f"backfill:{name}", f"backfill {name}", e)
+        if retry is not None:  # keep the history and the partial marker; try again later
+            nxt = dict(retry, attempt=retry["attempt"] + 1)
+            await _best_effort(
+                io,
+                name,
+                "state",
+                store.set_backfill,
+                name,
+                BackfillState.DONE,
+                json.dumps({"partial": nxt}),
+                bf.progress,
+            )
+            await _best_effort(io, name, "failure", store.record_failure, name, e)
+            return Result(
+                name,
+                BackfillState.DONE,
+                written,
+                error=redact(msg),
+                missing=tuple(nxt["missing"]),
+                retry_in=partial_delay(nxt["attempt"]),
+            )
         await _record_failed(store, io, name, e, cursor, progress)
         return Result(name, BackfillState.NOT_STARTED, written, error=redact(msg))
-    failures.recovered(f"backfill:{name}")
+    flog.recovered(f"backfill:{name}")
     log.info("backfill %s: done, %d points", name, written)
     return Result(name, BackfillState.DONE, written)
+
+
+async def _record_partial(store, io, flog, collector, missing, points, need, retry, written):
+    name = collector.name
+    attempt = retry["attempt"] + 1 if retry else 1
+    marker = {
+        "partial": {"attempt": attempt, "missing": list(missing), "points": points, "need": need}
+    }
+    present = len(collector.series) - len(missing)
+    delay = partial_delay(attempt)
+    parts = [f"{name}: partial backfill, history for {present} of {len(collector.series)} series"]
+    if missing:
+        parts.append(f"no data for {_names(missing)}")
+    if points < need:
+        parts.append(f"only {points} points (expected at least {need})")
+    parts.append(
+        f"full re-fetch in {delay / 3600:.0f} h; if a series is retired, run "
+        f"'fuelwatch backfill --only {name} --accept-missing'"
+    )
+    err = ProviderError("partial", "; ".join(parts))
+    flog.report(f"backfill:{name}", f"backfill {name}", err)
+    await io(
+        store.set_backfill,
+        name,
+        BackfillState.DONE,
+        json.dumps(marker),
+        present / max(1, len(collector.series)),
+    )
+    await io(store.record_failure, name, err)
+    return Result(name, BackfillState.DONE, written, missing=missing, retry_in=delay)
+
+
+async def _best_effort(io, name, what, fn, *args) -> None:
+    try:
+        await io(fn, *args)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 - logged; the retry loop carries on
+        if not is_store_closed(e):
+            log.error("backfill %s: could not record the %s: %s", name, what, type(e).__name__)
 
 
 async def _record_failed(store, io, name, error, cursor, progress) -> None:
     """Best effort: the store may be what failed. The state goes first, so
     a failing record_failure cannot leave it at "running"."""
-    for what, fn, args in (
-        ("state", store.set_backfill, (name, BackfillState.NOT_STARTED, cursor, progress)),
-        ("failure", store.record_failure, (name, error)),
-    ):
-        try:
-            await io(fn, *args)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - logged; the retry loop carries on
-            if not is_store_closed(e):
-                log.error("backfill %s: could not record the %s: %s", name, what, type(e).__name__)
+    await _best_effort(
+        io, name, "state", store.set_backfill, name, BackfillState.NOT_STARTED, cursor, progress
+    )
+    await _best_effort(io, name, "failure", store.record_failure, name, error)
 
 
 async def wait_or_stop(stop: asyncio.Event | None, seconds: float) -> bool:
@@ -288,62 +391,95 @@ async def run(
     retry_max: float = RETRY_MAX,
     now: Callable[[], datetime] = _utcnow,
     io: ThreadCalls | None = None,
+    flog: FailureLog | None = None,
     on_result: Callable[[Result], None] | None = None,
 ) -> dict[str, Result]:
     """Backfill every collector given (None: every polled one) that is not
-    done, retrying failures with a doubling delay. Returns when all are
-    done, `stop` is set, or a collector has failed `max_attempts` times
-    (None: keep retrying, as in the app). `on_result` is called after each
-    attempt."""
+    done. Failures are retried after `retry_start` doubling to `retry_max`;
+    a collector fails for good after `max_attempts` (None: never, as in the
+    app). A partial collector is re-fetched on its own schedule (up to 24 h
+    apart) while `max_attempts` is None; with `max_attempts` set (the CLI),
+    a partial result ends its run. Returns when nothing is left to do or
+    `stop` is set. `on_result` is called after each attempt."""
     collectors = _select(collectors)
     io = io or ThreadCalls()
+    flog = flog or FailureLog()
     own = client is None
     raw = make_client() if own else client
     http = paced(raw)
+    loop = asyncio.get_running_loop()
     results: dict[str, Result] = {}
     attempts: dict[str, int] = {}
-    delay = retry_start
+    pending = {c.name: c for c in collectors}
+    due = dict.fromkeys(pending, loop.time())
     try:
-        pending = list(collectors)
         while pending and not (stop is not None and stop.is_set()):
-            failed = []
-            for c in pending:
+            for name in [n for n in pending if due[n] <= loop.time()]:
                 if stop is not None and stop.is_set():
                     break
+                c = pending[name]
                 try:
-                    r = await backfill_collector(store, http, c, now=now, stop=stop, io=io)
+                    r = await backfill_collector(
+                        store, http, c, now=now, stop=stop, io=io, flog=flog
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001 - backfill_collector should not raise
-                    r = Result(c.name, BackfillState.NOT_STARTED, error=_message(e))
-                results[c.name] = r
+                    r = Result(name, BackfillState.NOT_STARTED, error=_message(e))
+                results[name] = r
                 if on_result is not None:
                     on_result(r)
-                if r.error is not None:
-                    attempts[c.name] = attempts.get(c.name, 0) + 1
-                    if max_attempts is None or attempts[c.name] < max_attempts:
-                        failed.append(c)
-            pending = failed
+                if r.partial:
+                    if max_attempts is not None or r.retry_in is None:
+                        del pending[name]
+                    else:
+                        due[name] = loop.time() + r.retry_in * random.uniform(1.0, 1.1)
+                elif r.error is not None:
+                    attempts[name] = attempts.get(name, 0) + 1
+                    if max_attempts is not None and attempts[name] >= max_attempts:
+                        del pending[name]
+                    else:
+                        delay = min(retry_start * 2 ** min(attempts[name] - 1, 20), retry_max)
+                        due[name] = loop.time() + delay * random.uniform(0.9, 1.1)
+                        log.info("backfill %s: retrying in %.0f s", name, due[name] - loop.time())
+                elif r.state == BackfillState.DONE:
+                    del pending[name]
+                else:  # interrupted (stop, or the store closed): resumes on the next start
+                    del pending[name]
             if pending:
-                wait = delay * random.uniform(0.9, 1.1)
-                log.info("backfill: retrying %s in %.0f s", [c.name for c in pending], wait)
-                if await wait_or_stop(stop, wait):
+                wait = max(0.0, min(due[n] for n in pending) - loop.time())
+                if wait and await wait_or_stop(stop, wait):
                     break
-                delay = min(delay * 2, retry_max)
     finally:
         if own:
             await raw.aclose()
     return results
 
 
+async def accept_missing(store: Store, name: str) -> tuple[str, ...]:
+    """Mark a partial collector done, keeping its missing series on record.
+    Raises ValueError if it is not partial."""
+    bf = await asyncio.to_thread(store.get_backfill, name)
+    info = partial_info(bf.cursor)
+    if bf.state != BackfillState.DONE or info is None or "partial" not in info:
+        raise ValueError(f"{name} is not a partial backfill (state {bf.state.value})")
+    missing = tuple(info["partial"]["missing"])
+    marker = json.dumps({"accepted_missing": list(missing)})
+    await asyncio.to_thread(store.set_backfill, name, BackfillState.DONE, marker, 1.0)
+    log.warning("backfill %s: accepted with no data for %s", name, _names(missing) or "none")
+    return missing
+
+
 @dataclass(frozen=True)
 class Summary:
     """Overall backfill state for /api/status."""
 
-    state: str  # "backfilling", "done" or "not_started"
+    state: str  # "not_started", "backfilling", "partial" or "done"
     progress: float  # mean over the collectors, 0 to 1
-    collectors: dict[str, BackfillState]
+    collectors: dict[str, str]  # not_started, running, partial or done
     errors: dict[str, str]  # collector -> sanitized reason its last attempt failed
+    missing: dict[str, tuple[str, ...]]  # partial collector -> series with no data
+    accepted_missing: dict[str, tuple[str, ...]]  # done, with these series accepted as absent
 
 
 def summary(store: Store, collectors: Iterable[Collector] | None = None) -> Summary:
@@ -351,20 +487,37 @@ def summary(store: Store, collectors: Iterable[Collector] | None = None) -> Summ
     names = [c.name for c in _select(collectors)]
     statuses = {n: store.get_status(n) for n in names}
     states = {n: store.get_backfill(n) for n in names}
-    progress = sum(1.0 if b.state == BackfillState.DONE else b.progress for b in states.values())
+    view: dict[str, str] = {}
+    missing: dict[str, tuple[str, ...]] = {}
+    accepted: dict[str, tuple[str, ...]] = {}
+    progress = 0.0
+    for n, b in states.items():
+        info = partial_info(b.cursor) if b.state == BackfillState.DONE else None
+        if info and "partial" in info:
+            view[n] = "partial"
+            missing[n] = tuple(info["partial"]["missing"])
+            progress += b.progress
+            continue
+        if info and "accepted_missing" in info:
+            accepted[n] = tuple(info["accepted_missing"])
+        view[n] = b.state.value
+        progress += 1.0 if b.state == BackfillState.DONE else b.progress
     progress /= max(1, len(states))
     errors = {
         n: st.error_message or st.error_class
         for n, st in statuses.items()
-        if st is not None and st.error_class and states[n].state != BackfillState.DONE
+        if st is not None and st.error_class and view[n] != "done"
     }
-    if all(b.state == BackfillState.DONE for b in states.values()):
+    values = set(view.values())
+    if values <= {"done"}:
         overall = "done"
-    elif all(b.state == BackfillState.NOT_STARTED for b in states.values()) and not errors:
+    elif values == {"not_started"} and not errors:
         overall = "not_started"
-    else:
+    elif values & {"not_started", "running"}:
         overall = "backfilling"
-    return Summary(overall, round(progress, 4), {n: b.state for n, b in states.items()}, errors)
+    else:
+        overall = "partial"
+    return Summary(overall, round(progress, 4), view, errors, missing, accepted)
 
 
 async def reset(store: Store, names: Iterable[str]) -> None:

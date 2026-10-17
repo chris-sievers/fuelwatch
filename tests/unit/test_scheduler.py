@@ -30,7 +30,6 @@ def small_fakes_are_plausible(monkeypatch):
     from fuelwatch import backfill
 
     monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 0)
-    monkeypatch.setattr(backfill, "REQUIRE_EVERY_SERIES", False)
 
 
 @pytest.fixture
@@ -510,6 +509,30 @@ async def test_closed_store_ends_ais_quietly(tmp_path, client, caplog):
     await asyncio.wait_for(loop_task, timeout=2)  # ended without `stop`
     assert not stop.is_set() and ais.runs == 1
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_ais_sink_failure_logged_once_per_slot(store, client, caplog):
+    locked = LockedStore(store, {"upsert_points"})
+    ais = SlotAis()
+    s = fast(locked, client, [], ais=ais, run_backfill=False)
+    stop = asyncio.Event()
+    task = asyncio.create_task(s._ais_loop(stop))
+    await until(lambda: ais.slots >= 4)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert not [r for r in caplog.records if r.name == "fake.ais"]  # the stream never re-logs
+    errs = [
+        r for r in caplog.records if r.levelno >= logging.ERROR and "AIS sink" in r.getMessage()
+    ]
+    assert len(errs) == ais.slots
+    assert bool(errs[0].exc_info or errs[0].exc_text)  # traceback the first time
+    assert all("(repeat)" in r.getMessage() for r in errs[1:])
+    assert store.get_status("aisstream").error_class == "internal"
+
+
+def test_failure_log_is_per_scheduler(store):
+    a, b = Scheduler(store, ais=None), Scheduler(store, ais=None)
+    assert a.flog is not b.flog
 
 
 async def test_ais_restart_delay_resets_after_a_healthy_run(store, client, monkeypatch):

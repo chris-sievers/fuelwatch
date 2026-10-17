@@ -113,10 +113,6 @@ def _message(e: BaseException) -> str:
     return redact(str(e)) if isinstance(e, ProviderError) else type(e).__name__
 
 
-def _log_failure(what: str, e: BaseException, key: str | None = None) -> None:
-    backfill.failures.report(key or what, what, e)
-
-
 class Scheduler:
     def __init__(
         self,
@@ -158,6 +154,7 @@ class Scheduler:
         self.http: PacedClient | None = backfill.paced(client) if client is not None else None
         self.failures: dict[str, int] = {c.name: 0 for c in self.collectors}
         self.io = ThreadCalls()  # every store call; drained at shutdown
+        self.flog = backfill.FailureLog(log)  # per instance: no state shared between schedulers
         self._backfill_task: asyncio.Task | None = None
         self._backfill_failed: set[str] = set()
 
@@ -200,8 +197,10 @@ class Scheduler:
             http = self._http()
             points: list[Point] = await backfill.unless_stopped(c.fetch(http, since), http.stop)
             n = await self.io(self.store.upsert_points, points)
-            if full:
-                await self.io(self.store.set_backfill, c.name, BackfillState.DONE, None, 1.0)
+            if full:  # restamp the refresh time; keep any partial marker
+                await self.io(
+                    self.store.set_backfill, c.name, BackfillState.DONE, bf.cursor, bf.progress
+                )
             await self.io(self.store.record_success, c.name)
         except asyncio.CancelledError:
             raise
@@ -210,13 +209,16 @@ class Scheduler:
                 raise  # shutting down: the loop ends quietly
             self.failures[c.name] = self.failures.get(c.name, 0) + 1
             if not isinstance(e, Stopped):
-                _log_failure(f"{c.name} poll", e, c.name)
+                self._log_failure(f"{c.name} poll", e, c.name)
                 await self._record_failure(c.name, e)
             return PollResult(c.name, since, error=_message(e))
         self.failures[c.name] = 0
-        backfill.failures.recovered(c.name)
+        self.flog.recovered(c.name)
         log.info("%s: %d points since %s", c.name, n, since)
         return PollResult(c.name, since, n)
+
+    def _log_failure(self, what: str, e: BaseException, key: str | None = None) -> None:
+        self.flog.report(key or what, what, e)
 
     async def _record_failure(self, name: str, e: BaseException) -> None:
         """Best effort: the store may be what failed."""
@@ -303,7 +305,7 @@ class Scheduler:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - keep waiting; the store may recover
-                _log_failure(f"{c.name} backfill check", e)
+                self._log_failure(f"{c.name} backfill check", e)
             if await backfill.wait_or_stop(stop, self.backfill_check):
                 return False
         return False
@@ -317,7 +319,7 @@ class Scheduler:
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 - poll after the first backoff step
-            _log_failure(f"{c.name} first delay", e)
+            self._log_failure(f"{c.name} first delay", e)
             delay = self._backoff(1)
         while not stop.is_set():
             if await backfill.wait_or_stop(stop, delay.total_seconds()):
@@ -333,7 +335,7 @@ class Scheduler:
                     log.debug("%s: store closed, loop stopping", c.name)
                     return
                 guard_failures += 1
-                _log_failure(f"{c.name} loop", e, c.name)
+                self._log_failure(f"{c.name} loop", e, c.name)
                 delay = self.retry_max  # cannot raise, unlike anything computed
                 with contextlib.suppress(Exception):
                     delay = self._backoff(max(guard_failures, self.failures.get(c.name, 0)))
@@ -356,15 +358,17 @@ class Scheduler:
             try:
                 await self.io(self.store.upsert_points, points)
                 await self.io(self.store.record_success, AIS_NAME)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - logged and recorded once, below
                 if is_store_closed(e):
                     log.debug("AIS: store closed, stopping the stream")
                     ais_stop.set()
                     return
-                _log_failure("AIS sink", e, AIS_NAME)
+                # Logged and recorded here, once; not re-raised, so the stream
+                # does not log it again with a traceback for every slot.
+                self._log_failure("AIS sink", e, AIS_NAME)
                 await self._record_failure(AIS_NAME, e)
-                raise
-            backfill.failures.recovered(AIS_NAME)
+                return
+            self.flog.recovered(AIS_NAME)
 
         async def mirror_status() -> None:
             # The stream reports connection errors on ais.status; copy each
@@ -389,7 +393,7 @@ class Scheduler:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001 - keep the rest of the app alive
-                    _log_failure("AIS stream", e, AIS_NAME)
+                    self._log_failure("AIS stream", e, AIS_NAME)
                     await self._record_failure(AIS_NAME, e)
                     if self.monotonic() - started >= AIS_RESTART_MAX:
                         delay = AIS_RESTART_START  # it ran healthily; start the backoff over
@@ -433,6 +437,7 @@ class Scheduler:
                         collectors=self.collectors,
                         stop=stop,
                         io=self.io,
+                        flog=self.flog,
                         on_result=self._backfill_result,
                     ),
                     name="backfill",

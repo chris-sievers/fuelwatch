@@ -25,7 +25,6 @@ FIX = Path(__file__).parent.parent / "fixtures"
 def small_fakes_are_plausible(monkeypatch):
     """The fakes return a handful of points; the threshold has its own tests."""
     monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 0)
-    monkeypatch.setattr(backfill, "REQUIRE_EVERY_SERIES", False)
 
 
 async def until(cond, timeout=5.0):
@@ -74,6 +73,15 @@ class Fake:
 
 
 def coll(name, fetch):
+    """A collector over just the series the fake returns (all the real
+    collector's series when it returns none), so a fake with one series is a
+    complete backfill. Use `full` for the real series list."""
+    real = REGISTRY.collector(name).series
+    have = {p.series for p in getattr(fetch, "points", [])}
+    return Collector(name, tuple(s for s in real if s.id in have) or real, fetch)
+
+
+def full(name, fetch):
     return Collector(name, REGISTRY.collector(name).series, fetch)
 
 
@@ -268,26 +276,28 @@ async def test_loop_runs_during_portwatch_parse(store, client, monkeypatch):
 # --- plausibility and store failures -----------------------------------------------------
 
 
-async def test_empty_full_backfill_is_a_failure(store, client, monkeypatch):
-    monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 52)
+async def test_empty_full_backfill_is_a_failure(store, client):
     f = Fake([])
     results = await backfill.run(
-        store, client, collectors=[coll("eia", f)], max_attempts=2, retry_start=0.001
+        store, client, collectors=[full("eia", f)], max_attempts=2, retry_start=0.001
     )
     assert len(f.calls) == 2  # retried, not marked done
-    assert results["eia"].error.startswith("eia: backfill returned 0 points for 23 series")
+    assert results["eia"].error == "eia: backfill returned no points"
     st = store.get_status("eia")
-    assert st.error_class == "implausible"
+    assert st.error_class == "empty"
     assert st.backfill.state == BackfillState.NOT_STARTED
 
 
-async def test_implausibly_small_backfill_is_a_failure(store, client, monkeypatch):
+async def test_short_backfill_is_partial_and_keeps_its_points(store, client, monkeypatch):
     monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 52)
-    c = coll("eu_oil_bulletin", Fake(daily("eu_pump_petrol_de", 519)))  # need 52 x 10
+    c = coll("eu_oil_bulletin", Fake(daily("eu_pump_petrol_de", 51)))  # need 52 x 1
     r = await backfill.backfill_collector(store, client, c)
-    assert r.error is not None and "expected at least 520" in r.error
-    ok = coll("eu_oil_bulletin", Fake(daily("eu_pump_petrol_de", 520)))
-    assert (await backfill.backfill_collector(store, client, ok)).state == BackfillState.DONE
+    assert r.partial and r.missing == () and r.error is None
+    assert len(store.points("eu_pump_petrol_de")) == 51
+    assert (
+        "only 51 points (expected at least 52)" in store.get_status("eu_oil_bulletin").error_message
+    )
+    assert backfill.summary(store, [c]).collectors == {"eu_oil_bulletin": "partial"}
 
 
 async def test_empty_resume_is_a_failure(store, client):
@@ -462,15 +472,19 @@ def test_cli_backfill_and_collect_once(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("FW_DATA_DIR", str(tmp_path))
     calls = []
 
-    def fake(series):
+    def fake(name):
         async def fetch(client, since=None):
-            calls.append((series, since))
-            return daily(series, 10, start=date(2026, 10, 1))
+            calls.append((name, since))
+            return [
+                p
+                for s in REGISTRY.collector(name).series
+                for p in daily(s.id, 10, start=date(2026, 10, 1))
+            ]
 
         return fetch
 
-    monkeypatch.setattr(eia, "fetch", fake("eia.spot.brent"))
-    monkeypatch.setattr(portwatch, "fetch", fake("portwatch.suez.all"))
+    monkeypatch.setattr(eia, "fetch", fake("eia"))
+    monkeypatch.setattr(portwatch, "fetch", fake("portwatch"))
 
     async def broken(client, since=None):
         raise ProviderError("bad_xlsx", "response is not a readable XLSX workbook")
@@ -480,9 +494,9 @@ def test_cli_backfill_and_collect_once(tmp_path, monkeypatch, capsys):
 
     assert cli_main(["backfill", "--attempts", "1"]) == 1
     out = capsys.readouterr().out
-    assert "eia" in out and "10 rows in 1/23 series" in out
+    assert "230 rows in 23/23 series" in out
     assert "ERROR response is not a readable XLSX workbook" in out
-    assert ("eia.spot.brent", None) in calls
+    assert ("eia", None) in calls
 
     assert cli_main(["backfill", "--only", "eia"]) == 0
     assert "already done" in capsys.readouterr().out
@@ -491,10 +505,10 @@ def test_cli_backfill_and_collect_once(tmp_path, monkeypatch, capsys):
     assert cli_main(["collect", "--once", "--only", "eia", "--only", "portwatch"]) == 0
     out = capsys.readouterr().out
     assert sorted(calls) == [
-        ("eia.spot.brent", date(2026, 10, 10) - timedelta(days=14)),
-        ("portwatch.suez.all", date(2026, 10, 10) - timedelta(days=35)),
+        ("eia", date(2026, 10, 10) - timedelta(days=14)),
+        ("portwatch", date(2026, 10, 10) - timedelta(days=35)),
     ]
-    assert "10 points" in out
+    assert "230 points" in out
 
 
 def test_cli_unknown_collector_is_an_error(tmp_path, monkeypatch, capsys):
@@ -514,31 +528,39 @@ def _every_eia_series(n=60):
     return [p for s in REGISTRY.collector("eia").series for p in daily(s.id, n)]
 
 
-async def test_partial_outage_is_a_failure(store, client, monkeypatch):
+async def test_partial_outage_keeps_history_and_retries(store, client, monkeypatch):
     """EIA's spot route answers but retail, stocks and refinery come back
-    empty: enough points on average, but 19 series have none."""
+    empty: the spot history is stored, the collector is partial with the 19
+    series named, and a later full fetch with everything completes it."""
     monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 52)
-    monkeypatch.setattr(backfill, "REQUIRE_EVERY_SERIES", True)
     spot = [
         p
         for s in ("brent", "wti", "nyh_gasoline", "nyh_ulsd")
         for p in daily(f"eia.spot.{s}", 1250)
     ]
-    assert len(spot) >= 52 * 23  # the average alone would pass
-    r = await backfill.backfill_collector(store, client, coll("eia", Fake(spot)))
-    assert r.error is not None
-    assert "no points for 19 of 23 series" in r.error and "eia.refinery.utilization" in r.error
-    assert store.get_backfill("eia").state == BackfillState.NOT_STARTED
-    assert store.get_status("eia").error_class == "implausible"
+    r = await backfill.backfill_collector(store, client, full("eia", Fake(spot)))
+    assert r.partial and r.error is None
+    assert len(r.missing) == 19 and "eia.refinery.utilization" in r.missing
+    assert r.retry_in == backfill.PARTIAL_RETRY_START
+    assert len(store.points("eia.spot.brent")) == 1250  # nothing thrown away
+    st = store.get_status("eia")
+    assert st.backfill.state == BackfillState.DONE  # polls are not blocked
+    assert st.error_class == "partial"
+    assert "history for 4 of 23 series" in st.error_message
 
-    ok = await backfill.backfill_collector(store, client, coll("eia", Fake(_every_eia_series())))
-    assert ok.state == BackfillState.DONE
+    ok = full("eia", Fake(_every_eia_series()))
+    # Not due yet: skipped.
+    assert (await backfill.backfill_collector(store, client, ok)).skipped
+    later = lambda: datetime.now(UTC) + timedelta(hours=2)
+    r2 = await backfill.backfill_collector(store, client, ok, now=later)
+    assert r2.state == BackfillState.DONE and not r2.partial
+    assert backfill.summary(store, [ok]).state == "done"
 
 
 async def test_failed_record_failure_still_resets_state(store, client):
     locked = LockedStore(store, {"record_failure"})
     r = await backfill.backfill_collector(
-        locked, client, coll("eia", Fake(error=ProviderError("http_status", "503")))
+        locked, client, full("eia", Fake(error=ProviderError("http_status", "503")))
     )
     assert r.error == "503"
     assert store.get_backfill("eia").state == BackfillState.NOT_STARTED
@@ -586,3 +608,110 @@ async def test_drain_timeout_holds_with_executor_saturated():
     release.set()
     await task
     assert await calls.drain(timeout=1) is True
+
+
+# --- partial backfills -------------------------------------------------------------------
+
+
+def _eu_without(missing="eu_pump_diesel_es", n=60):
+    return [
+        p
+        for s in REGISTRY.collector("eu_oil_bulletin").series
+        if s.id != missing
+        for p in daily(s.id, n)
+    ]
+
+
+async def test_one_absent_series_partial_then_accept(store, client, tmp_path, monkeypatch, capsys):
+    """A retired series: the other nine are stored, state partial naming it,
+    polls run, a retry is scheduled; --accept-missing marks it done."""
+    from fuelwatch import registry
+    from fuelwatch.scheduler import Scheduler
+
+    f = Fake(_eu_without())
+    c = full("eu_oil_bulletin", f)
+    loop_results = []
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        backfill.run(store, client, collectors=[c], stop=stop, on_result=loop_results.append)
+    )
+    await until(lambda: loop_results)
+    r = loop_results[0]
+    assert r.partial and r.missing == ("eu_pump_diesel_es",)
+    assert not task.done()  # the app keeps the collector scheduled for a retry
+    stop.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert len(store.points("eu_pump_petrol_de")) == 60
+    st = store.get_status("eu_oil_bulletin")
+    assert st.backfill.state == BackfillState.DONE
+    assert st.error_class == "partial" and "no data for eu_pump_diesel_es" in st.error_message
+    s = backfill.summary(store, [c])
+    assert s.state == "partial" and s.missing == {"eu_oil_bulletin": ("eu_pump_diesel_es",)}
+    # The missing series stays visible as no_data.
+    assert registry.freshness("eu_pump_diesel_es", None, NOW).status.value == "no_data"
+
+    # Polls run normally for a partial collector.
+    polled = Fake([])
+    sched = Scheduler(store, client=client, collectors=[coll("eu_oil_bulletin", polled)], ais=None)
+    sched._backfill_task = asyncio.get_running_loop().create_future()  # a "running" backfill
+    assert await asyncio.wait_for(sched._wait_backfill(sched.collectors[0], asyncio.Event()), 1)
+
+    # The operator accepts the absent series.
+    monkeypatch.setenv("FW_DATA_DIR", str(tmp_path))
+    argv = ["backfill", "--only", "eu_oil_bulletin", "--accept-missing"]
+    assert await asyncio.to_thread(cli_main, argv) == 0
+    out = capsys.readouterr().out
+    assert "accepted" in out and "eu_pump_diesel_es" in out
+    s = backfill.summary(store, [c])
+    assert s.state == "done" and s.accepted_missing == {"eu_oil_bulletin": ("eu_pump_diesel_es",)}
+    assert await backfill.run(store, client, collectors=[c]) == {
+        "eu_oil_bulletin": backfill.Result("eu_oil_bulletin", BackfillState.DONE, skipped=True)
+    }
+
+
+async def test_accept_missing_refuses_a_collector_that_is_not_partial(store):
+    with pytest.raises(ValueError, match="not a partial backfill"):
+        await backfill.accept_missing(store, "eia")
+
+
+def test_cli_accept_missing_needs_only(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FW_DATA_DIR", str(tmp_path))
+    with pytest.raises(SystemExit) as ei:
+        cli_main(["backfill", "--accept-missing"])
+    assert ei.value.code == 2
+    assert cli_main(["backfill", "--only", "eia", "--accept-missing"]) == 1
+    assert "not a partial backfill" in capsys.readouterr().out
+
+
+async def test_cli_partial_exits_nonzero_without_waiting(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FW_DATA_DIR", str(tmp_path))
+    pts = _eu_without()
+
+    async def fetch(client, since=None):
+        return pts
+
+    monkeypatch.setattr(eu_oil_bulletin, "fetch", fetch)
+    rc = await asyncio.to_thread(cli_main, ["backfill", "--only", "eu_oil_bulletin"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "partial" in out and "eu_pump_diesel_es" in out and "--accept-missing" in out
+
+
+async def test_partial_retry_failure_keeps_history_and_backs_off(store, client):
+    c = full("eu_oil_bulletin", Fake(_eu_without()))
+    first = await backfill.backfill_collector(store, client, c)
+    assert first.retry_in == backfill.PARTIAL_RETRY_START
+    later = lambda: datetime.now(UTC) + timedelta(hours=2)
+    bad = full("eu_oil_bulletin", Fake(error=ProviderError("transport", "ConnectError")))
+    r = await backfill.backfill_collector(store, client, bad, now=later)
+    assert r.error == "ConnectError" and r.partial
+    assert r.retry_in == 2 * backfill.PARTIAL_RETRY_START
+    assert store.get_backfill("eu_oil_bulletin").state == BackfillState.DONE
+    assert len(store.points("eu_pump_petrol_de")) == 60
+
+
+def test_partial_retry_delay_caps_at_a_day():
+    assert backfill.partial_delay(1) == 3600
+    assert backfill.partial_delay(5) == 16 * 3600
+    assert backfill.partial_delay(6) == backfill.partial_delay(500) == 24 * 3600

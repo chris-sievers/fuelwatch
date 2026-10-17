@@ -71,6 +71,18 @@ async def _backfill(args) -> int:
     from fuelwatch.http import make_client
 
     collectors = _chosen(args.only)
+    if args.accept_missing:
+        rc = 0
+        with Store() as store:
+            for c in collectors:
+                try:
+                    missing = await backfill.accept_missing(store, c.name)
+                except ValueError as e:
+                    print(f"  {c.name:16} {e}")
+                    rc = 1
+                    continue
+                print(f"  {c.name:16} accepted as done; no data for: {', '.join(missing) or '-'}")
+        return rc
     started = time.monotonic()
     with Store() as store:
         if args.reset:
@@ -82,18 +94,27 @@ async def _backfill(args) -> int:
             )
         elapsed = time.monotonic() - started
         print(f"backfill finished in {elapsed:.1f} s")
+        partial = [r for r in results.values() if r.partial]
         for r in results.values():
+            state = "partial" if r.partial else r.state.value
             note = "already done" if r.skipped else f"{r.rows} points written"
+            if r.missing:
+                note += f"; no data for {', '.join(r.missing)}"
             print(
-                f"  {r.collector:16} {r.state.value:8} {note}"
-                + (f"  ERROR {r.error}" if r.error else "")
+                f"  {r.collector:16} {state:8} {note}" + (f"  ERROR {r.error}" if r.error else "")
+            )
+        for r in partial:
+            print(
+                f"  {r.collector} is partial: the app retries a full fetch; if a series is "
+                f"retired, run: fuelwatch backfill --only {r.collector} --accept-missing"
             )
         print("stored:")
         print("\n".join(_series_report(store, [c.name for c in collectors])))
         print("HTTP requests:", dict(sorted(http.requests.items())) or "none")
         if http.rate_limited:
             print("rate-limited responses:", http.rate_limited)
-    return 0 if all(r.error is None for r in results.values()) else 1
+    ok = all(r.error is None and not r.partial for r in results.values())
+    return 0 if ok else 1
 
 
 async def _collect_once(args) -> int:
@@ -127,10 +148,17 @@ def main(argv: list[str] | None = None) -> int:
     bf.add_argument("--reset", action="store_true", help="redo collectors already done")
     bf.add_argument("--only", action="append", choices=names, help="limit to a collector")
     bf.add_argument("--attempts", type=int, default=3, help="tries per collector (default 3)")
+    bf.add_argument(
+        "--accept-missing",
+        action="store_true",
+        help="mark a partial collector done, keeping its missing series on record (needs --only)",
+    )
     c = sub.add_parser("collect", help="poll the collectors")
     c.add_argument("--once", action="store_true", required=True, help="poll each once and exit")
     c.add_argument("--only", action="append", choices=names, help="limit to a collector")
     args = parser.parse_args(argv)
+    if getattr(args, "accept_missing", False) and not args.only:
+        parser.error("--accept-missing needs --only COLLECTOR")
 
     if args.command == "backup":
         dest = args.dest or data_dir() / BACKUP_NAME
