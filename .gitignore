@@ -16,3 +16,4 @@ dist/
 build/
 .claude/
 .ruff_cache/
+tests/ui/artifacts/

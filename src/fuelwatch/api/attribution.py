@@ -60,3 +60,34 @@ def attribution(source: str, release: date | None = None) -> str:
 
 def terms_url(source: str) -> str | None:
     return TERMS_URLS.get(source)
+
+
+# Short credits for the page's tiles and footer rows, where the full line
+# above does not fit. The full lines are on each chart and on /about.
+_CREDITS = {
+    eia.SOURCE: "Source: U.S. Energy Information Administration (EIA).",
+    portwatch.SOURCE: "Sources: Kpler; UN Global Platform; IMF PortWatch (portwatch.imf.org).",
+    eu_oil_bulletin.SOURCE: "Source: European Commission, Weekly Oil Bulletin (CC BY 4.0).",
+    aisstream.SERIES[0].source: "Live counts: Fuelwatch, from AISStream (aisstream.io).",
+}
+_SPOT_CREDIT = (
+    "Source: U.S. Energy Information Administration (EIA), from Refinitiv, an LSEG business."
+)
+
+
+def credit(source: str, *, spot: bool = False) -> str:
+    """A one-line credit for `source`; ``spot`` names Refinitiv, for the four
+    EIA spot series."""
+    if spot and source == eia.SOURCE:
+        return _SPOT_CREDIT
+    return _CREDITS[source]
+
+
+def all_lines() -> list[str]:
+    """Every full attribution line, for the About page."""
+    return [
+        _EIA_NO_DATE,
+        _PORTWATCH,
+        _EU,
+        _AIS,
+    ]

@@ -1,12 +1,11 @@
 """Time model and calculation tests: known inputs in a tmp_path Store,
 expected values worked out by hand in the comments."""
 
-import re
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from fuelwatch import calc
+from fuelwatch import calc, jargon
 from fuelwatch.collectors import eia, eu_oil_bulletin, portwatch
 from fuelwatch.models import Point
 from fuelwatch.store import Store
@@ -723,38 +722,13 @@ def test_price_change_wording(x, text):
     assert calc._cents(x) == text
 
 
-# Jargon that lives only on the About page.
-JARGON = [
-    "PADD",
-    "distillate",
-    "WPSR",
-    "AIS",
-    "SPR",
-    "WTI",
-    "ULSD",
-    "RBOB",
-    "Cushing",
-    "chokepoint",
-    "provisional",
-    "settled",
-    "baseline",
-    "spot",
-    "bbl",
-    "MMSI",
-    "Class A",
-    "deadweight",
-    "DWT",
-    "EIA",
-    "PortWatch",
-    "ISO",
-    "percentile",
-    "y/y",
-]
-TILE_LABEL_EXCEPTIONS = {"WTI"}  # may appear as a tile label
+# Jargon that lives only on the About page: the shared list in fuelwatch.jargon.
+JARGON = list(jargon.JARGON)
+TILE_LABEL_EXCEPTIONS = jargon.ALLOWED_LABELS  # may appear as a tile label
 
 
 def _jargon_in(text: str, words) -> list[str]:
-    return [w for w in words if re.search(rf"\b{re.escape(w)}\b", text, re.IGNORECASE)]
+    return jargon.found(text, words)
 
 
 @pytest.mark.parametrize(

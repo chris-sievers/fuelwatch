@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import date, timedelta
 
@@ -56,12 +57,33 @@ def test_healthz_returns_only_ok(client):
 
 
 @pytest.mark.parametrize("path", ["/", "/about"])
-def test_placeholder_pages(client, path):
+def test_pages_are_csp_clean(client, path):
     r = client.get(path)
     assert r.status_code == 200
-    assert "milestone 3" in r.text
-    assert "<script" not in r.text and "style=" not in r.text  # nothing the CSP would block
+    assert r.headers["content-type"].startswith("text/html")
+    assert r.headers["cache-control"] == "no-cache"
+    html = r.text
+    # nothing the CSP would block: no inline script or style, no event
+    # handler attributes, nothing from another origin
+    assert "style=" not in html and "<style" not in html
+    assert not re.search(r"<script(?![^>]*\bsrc=\"/static/)", html)
+    assert not re.search(r"\son[a-z]+=", html)
+    assert not re.search(r"(src|href)=\"(https?:)?//", html.split("<main", 1)[0])
     assert_headers(r)
+
+
+def test_static_files_served_with_headers(client):
+    for path, kind in [
+        ("/static/app.js", "javascript"),
+        ("/static/app.css", "text/css"),
+        ("/static/icon.svg", "image/svg+xml"),
+        ("/static/vendor/chart.js-4.5.1/chart.umd.min.js", "javascript"),
+    ]:
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert kind in r.headers["content-type"], path
+        assert_headers(r)
+    assert client.get("/static/nope.js").status_code == 404
 
 
 def test_version_defaults_to_unknown(client, monkeypatch):
@@ -114,7 +136,7 @@ def test_series_lists_every_registered_series(client):
     assert brent["status"] in ("ok", "late")
     assert brent["unit"] == "$/bbl" and brent["frequency"] == "daily"
     assert brent["as_of"] == "2026-10-14"
-    assert brent["data_api"] is False  # spot: latest values only
+    assert brent["data_api"] is True  # spot: served by default (FW_API_SPOT_DATA=1)
     assert "released 2026-10-15" in brent["attribution"]  # Columbus Day moved it to Thursday
     assert "Refinitiv" in brent["attribution"]
     hz = by[calc.HORMUZ]
@@ -233,32 +255,45 @@ def test_five_years_exactly_is_allowed(client):
     assert len(r.json()["points"]) > 250
 
 
-def test_spot_series_excluded_by_default(client):
+def test_spot_series_excluded_when_switched_off(make_client):
+    c = make_client(spot_data=False)
     for sid in views.SPOT_SERIES:
-        r = client.get(f"/api/data/{sid}")
+        r = c.get(f"/api/data/{sid}")
         assert r.status_code == 403, sid
         assert "Refinitiv" in r.json()["detail"]
         assert_headers(r)
-    # still shown as latest values
-    by = {s["id"]: s for s in client.get("/api/series").json()["series"]}
+    # still shown as latest values and charted on the dashboard
+    by = {s["id"]: s for s in c.get("/api/series").json()["series"]}
     assert by[calc.BRENT]["latest"] is not None
-    tiles = client.get("/api/summary").json()["tiles"]
+    assert by[calc.BRENT]["data_api"] is False
+    tiles = c.get("/api/summary").json()["tiles"]
     assert tiles[0]["key"] == "brent" and tiles[0]["value"] is not None
+    assert c.get("/api/dashboard").json()["crude"]["brent"]
 
 
-def test_spot_series_served_when_enabled(make_client):
-    c = make_client(spot_data=True)
+def test_spot_series_served_by_default(make_client):
+    c = make_client()
     r = c.get(f"/api/data/{calc.BRENT}", params={"start": "2026-10-12", "end": "2026-10-14"})
     assert r.status_code == 200
     assert [p["period"] for p in r.json()["points"]] == ["2026-10-12", "2026-10-13", "2026-10-14"]
+    assert "Refinitiv" in r.json()["attribution"]
     by = {s["id"]: s for s in c.get("/api/series").json()["series"]}
     assert by[calc.BRENT]["data_api"] is True
 
 
+def test_spot_data_keeps_the_five_year_cap(make_client):
+    c = make_client()
+    r = c.get(f"/api/data/{calc.BRENT}", params={"start": "2020-01-01", "end": "2026-10-14"})
+    assert r.status_code == 400
+
+
 def test_spot_setting_from_env(make_client, monkeypatch, db_path, clock):
+    monkeypatch.delenv("FW_API_SPOT_DATA", raising=False)
+    assert make_client(spot_data=None).get(f"/api/data/{calc.WTI}").status_code == 200
+    monkeypatch.setenv("FW_API_SPOT_DATA", "0")
+    assert make_client(spot_data=None).get(f"/api/data/{calc.WTI}").status_code == 403
     monkeypatch.setenv("FW_API_SPOT_DATA", "1")
-    c = make_client(spot_data=None)
-    assert c.get(f"/api/data/{calc.WTI}").status_code == 200
+    assert make_client(spot_data=None).get(f"/api/data/{calc.WTI}").status_code == 200
     monkeypatch.setenv("FW_API_SPOT_DATA", "yes")
     with pytest.raises(ValueError, match="FW_API_SPOT_DATA"):
         create_app(scheduler_factory=None, metrics_port=None)
@@ -570,6 +605,9 @@ def test_planted_key_appears_in_no_response_and_not_in_metrics(make_client, db_p
         "/api/status",
         "/api/version",
         "/api/data/nope",
+        "/api/dashboard?range=war",
+        "/api/dashboard?range=1y",
+        "/api/dashboard?range=5y",
     ]
     paths += [f"/api/data/{e.id}" for e in REGISTRY]
     bodies = {}

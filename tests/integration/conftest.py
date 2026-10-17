@@ -111,7 +111,8 @@ def make_client(db_path, clock):
         kw.setdefault("scheduler_factory", None)
         kw.setdefault("metrics_port", None)
         kw.setdefault("clock", clock)
-        kw.setdefault("spot_data", False)
+        kw.setdefault("spot_data", True)  # the default, FW_API_SPOT_DATA=1
+        kw.setdefault("demo", False)
         client = TestClient(create_app(**kw), raise_server_exceptions=False)
         client.__enter__()
         started.append(client)

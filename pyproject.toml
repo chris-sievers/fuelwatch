@@ -27,6 +27,11 @@ dev = [
   "respx>=0.21",
   "ruff>=0.5",
 ]
+# The UI tests (tests/ui): headless Chromium. Also run
+# `python -m playwright install chromium` once.
+ui = [
+  "playwright==1.63.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fuelwatch"]
@@ -37,6 +42,7 @@ asyncio_mode = "auto"
 addopts = "--import-mode=importlib"
 markers = [
   "contract: calls a real provider; runs only with FW_CONTRACT=1",
+  "ui: drives headless Chromium against the demo app; runs only with FW_UI=1",
 ]
 
 [tool.ruff]
