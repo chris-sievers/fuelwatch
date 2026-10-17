@@ -27,6 +27,7 @@ them up only for the range that is re-fetched, so callers should re-fetch
 at least REVISION_WINDOW on every run.
 """
 
+import asyncio
 import logging
 import math
 from dataclasses import dataclass
@@ -240,7 +241,7 @@ async def fetch_rows(
     offset = 0
     for _ in range(MAX_PAGES):
         doc = await get_json(client, QUERY_URL, **query_params(start, offset, page_size))
-        page = parse_page(doc)
+        page = await asyncio.to_thread(parse_page, doc)  # off the event loop
         rows.extend(page)
         n = len(doc["features"])  # parse_page has checked the shape
         offset += n
@@ -251,4 +252,5 @@ async def fetch_rows(
 
 async def fetch(client: httpx.AsyncClient, since: date | None = None) -> list[Point]:
     start = since or (datetime.now(UTC).date() - BACKFILL)
-    return to_points(await fetch_rows(client, start))
+    rows = await fetch_rows(client, start)
+    return await asyncio.to_thread(to_points, rows)

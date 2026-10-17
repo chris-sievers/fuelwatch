@@ -20,6 +20,7 @@ price date (UTC midnight), converted to EUR per litre. Blank cells are gaps:
 no point is written for them, and never a zero.
 """
 
+import asyncio
 import io
 import zipfile
 from collections.abc import Iterable, Sequence
@@ -230,15 +231,19 @@ async def _get_bytes(client: httpx.AsyncClient, url: str) -> bytes:
 
 
 async def fetch(client: httpx.AsyncClient, since: date | None = None) -> list[Point]:
-    """`since=None` backfills five years from the history workbook. A recent
+    """Parsing runs in a worker thread. `since=None` backfills five years from the history workbook. A recent
     `since` reads only the small latest-prices file."""
     today = datetime.now(UTC).date()
     if since is not None and today - since <= LATEST_ONLY_WINDOW:
-        rows = read_rows(await _get_bytes(client, LATEST_URL))
-        points = parse_latest(rows)
+        content = await _get_bytes(client, LATEST_URL)
+        points = await asyncio.to_thread(lambda: parse_latest(read_rows(content)))
         return [p for p in points if p.period_end.date() >= since]
 
     if since is None:
         since = today - timedelta(days=round(365.25 * BACKFILL_YEARS))
-    rows = read_rows(await _get_bytes(client, HISTORY_URL), HISTORY_SHEET)
-    return parse_history(rows, since=since)
+    content = await _get_bytes(client, HISTORY_URL)
+    # Reading the 4.5 MB workbook takes seconds: do it in a worker thread so
+    # the event loop keeps serving requests.
+    return await asyncio.to_thread(
+        lambda: parse_history(read_rows(content, HISTORY_SHEET), since=since)
+    )
