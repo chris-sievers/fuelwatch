@@ -24,7 +24,10 @@ Counting rules, per 10-minute slot [start, end):
   crossing line during the slot.
 * A slot is emitted only if the stream was live for the whole slot. Any
   outage, or a start part-way through, means no points for that slot:
-  never zeros.
+  never zeros while disconnected.
+* "Live" is the connection's health (`connected()` / `disconnected()`), not
+  traffic. A slot that was live throughout but heard no ships is a real
+  zero and is emitted as one.
 """
 
 from __future__ import annotations

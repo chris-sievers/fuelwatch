@@ -176,6 +176,16 @@ def test_brief_outage_inside_slot_drops_that_slot_only():
     assert values(t.close_slot(T0 + 20 * MIN))[SERIES_SHIPS] == 1
 
 
+def test_quiet_slot_on_live_connection_is_a_real_zero():
+    t = live_tracker()  # connected, but nobody broadcasting in the box
+    assert values(t.close_slot(T0 + 10 * MIN)) == {
+        SERIES_SHIPS: 0,
+        SERIES_TANKERS: 0,
+        SERIES_CROSSINGS: 0,
+        SERIES_TANKER_CROSSINGS: 0,
+    }
+
+
 def test_disconnect_just_after_slot_end_keeps_completed_slot():
     t = live_tracker()
     t.position("636019825", *WEST, T0 + MIN)

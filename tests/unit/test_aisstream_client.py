@@ -11,6 +11,8 @@ from fuelwatch.collectors import aisstream
 from fuelwatch.collectors.ais_tracker import SERIES_SHIPS, SERIES_TANKERS, Tracker
 from fuelwatch.collectors.aisstream import (
     BACKOFF_MAX,
+    PING_INTERVAL,
+    PING_TIMEOUT,
     SERIES,
     AisStreamCollector,
     Confirmation,
@@ -110,10 +112,19 @@ def test_from_env(monkeypatch):
 
 
 class FakeWS:
-    def __init__(self, frames, end_exc=None):
+    def __init__(self, frames, end_exc=None, pong=True):
         self.frames = list(frames)
         self.end_exc = end_exc or ConnectionClosedError(None, None)
         self.sent = []
+        self.pong = pong  # False: pings are never answered (a dead peer)
+        self.pings = 0
+
+    async def ping(self):
+        self.pings += 1
+        waiter = asyncio.get_running_loop().create_future()
+        if self.pong:
+            waiter.set_result(0.0)
+        return waiter
 
     async def __aenter__(self):
         return self
@@ -158,6 +169,8 @@ async def test_session_marks_live_then_disconnected_and_backs_off():
 
     def connect(url, **kw):
         assert kw["compression"] == "deflate"
+        # liveness is the websocket keepalive, not message silence
+        assert kw["ping_interval"] == PING_INTERVAL and kw["ping_timeout"] == PING_TIMEOUT
         if sockets:
             return sockets.pop(0)
         raise OSError("connection refused")
@@ -211,16 +224,16 @@ async def test_ticker_emits_only_covered_slots_and_never_zeros():
         boundary = clock.t
         if boundary == T0 + timedelta(minutes=10):  # first, partial slot: connected at 12:03
             t.position("636019825", 26.6, 56.35, boundary + timedelta(seconds=1))
-        elif boundary == T0 + timedelta(minutes=20):
-            t.disconnected(boundary + timedelta(minutes=1))  # down 12:21 to 12:35
         elif boundary == T0 + timedelta(minutes=30):
-            t.connected(boundary + timedelta(minutes=5))
-            t.position("636019825", 26.6, 56.35, boundary + timedelta(minutes=6))
+            t.disconnected(T0 + timedelta(minutes=21))  # down 12:21 to 12:35
+            t.connected(T0 + timedelta(minutes=35))
+            t.position("636019825", 26.6, 56.35, T0 + timedelta(minutes=36))
         elif boundary >= T0 + timedelta(minutes=60):
             stop.set()
 
     t.connected(clock.t)
     c = AisStreamCollector(KEY, tracker=t, clock=clock, sleep=sleep)
+    c._ws = FakeWS([])  # a healthy socket answers the slot-end ping
     await c._tick(sink, stop)
 
     ends = [pts[0].period_end for pts in emitted]
@@ -261,3 +274,148 @@ async def test_run_stops_promptly_while_socket_is_quiet():
     assert json.loads(ws.sent[0])["APIKey"] == KEY
     assert not c.tracker.live and not c.status.connected
     assert len(c.snapshot()) == 1  # positions stay on the map until they expire
+
+
+# --- liveness: keepalive pings, not message silence ------------------------------------
+
+
+class QuietWS(FakeWS):
+    """Delivers its frames, then stays silent until `die` is set, when it
+    fails the way websockets does after a keepalive ping times out."""
+
+    def __init__(self, frames, **kw):
+        super().__init__(frames, **kw)
+        self.die = asyncio.Event()
+
+    async def recv(self):
+        await asyncio.sleep(0)
+        if self.frames:
+            return self.frames.pop(0)
+        await self.die.wait()
+        raise ConnectionClosedError(None, None)
+
+
+def scripted_run(sockets, clock, on_tick, *, stop_after):
+    """A collector whose ticker sleeps advance the fake clock. `on_tick(t)`
+    runs before the clock moves to boundary t; reconnect backoff sleeps just
+    yield. Stops after `stop_after` sink calls."""
+    stop = asyncio.Event()
+    emitted = []
+    connects = []
+
+    def connect(url, **kw):
+        assert kw["ping_interval"] == PING_INTERVAL and kw["ping_timeout"] == PING_TIMEOUT
+        ws = sockets.pop(0)
+        connects.append(ws)
+        return ws
+
+    async def sleep(d):
+        for _ in range(5):
+            await asyncio.sleep(0)  # let the stream task catch up
+        if d < 30:  # reconnect backoff
+            clock.t += timedelta(seconds=d)
+            return
+        await on_tick(clock.t + timedelta(seconds=d))
+        clock.t += timedelta(seconds=d)
+
+    async def sink(points):
+        emitted.append(points)
+        if len(emitted) >= stop_after:
+            stop.set()
+
+    c = AisStreamCollector(KEY, connect=connect, clock=clock, sleep=sleep)
+    return c, sink, stop, emitted, connects
+
+
+async def test_quiet_connection_covers_its_slots_and_emits_zeros():
+    # Subscription confirmed at 11:58, then nothing at all for 30 minutes.
+    ws = QuietWS([fixture("subscription_confirmation.json")])
+    clock = Clock(T0 - timedelta(minutes=2))
+
+    async def on_tick(boundary):
+        pass
+
+    c, sink, stop, emitted, connects = scripted_run([ws], clock, on_tick, stop_after=3)
+    await asyncio.wait_for(c.run(sink, stop), timeout=5)
+
+    assert [pts[0].period_end for pts in emitted] == [
+        T0 + timedelta(minutes=10),
+        T0 + timedelta(minutes=20),
+        T0 + timedelta(minutes=30),
+    ]
+    assert all(p.value == 0 for pts in emitted for p in pts)  # real zeros, all four series
+    assert len(connects) == 1 and c.status.reconnects == 0  # silence never reconnects
+    assert ws.pings == 3  # each emitted slot was confirmed by a pong
+    assert c.status.error_class is None
+    # a long silence is surfaced in status, not acted on
+    assert "no AIS messages for 32 minutes" in c.status.note
+
+
+async def test_failed_keepalive_reconnects_and_drops_the_slot():
+    ws1 = QuietWS([fixture("subscription_confirmation.json")])
+    ws2 = QuietWS([fixture("subscription_confirmation.json")])
+    clock = Clock(T0 - timedelta(minutes=2))
+
+    async def on_tick(boundary):
+        if boundary == T0 + timedelta(minutes=20):
+            clock.t = T0 + timedelta(minutes=15)  # keepalive ping times out at 12:15
+            ws1.die.set()
+            for _ in range(20):
+                await asyncio.sleep(0)  # fail, back off, reconnect, confirm
+
+    c, sink, stop, emitted, connects = scripted_run([ws1, ws2], clock, on_tick, stop_after=2)
+    await asyncio.wait_for(c.run(sink, stop), timeout=5)
+
+    # 12:10 covered by ws1; 12:20 overlaps the 12:15 outage, so no points
+    # (not zeros); 12:30 covered by ws2.
+    assert [pts[0].period_end for pts in emitted] == [
+        T0 + timedelta(minutes=10),
+        T0 + timedelta(minutes=30),
+    ]
+    assert connects == [ws1, ws2] and c.status.reconnects == 1
+
+
+async def test_unanswered_slot_end_ping_drops_the_slot(monkeypatch):
+    # The peer is gone but the keepalive has not noticed yet: the ping sent
+    # at the slot end gets no pong, so the slot is not emitted.
+    monkeypatch.setattr(aisstream, "PING_TIMEOUT", 0.01)
+    t = Tracker()
+    t.connected(T0 - timedelta(minutes=1))
+    t.position("636019825", 26.6, 56.35, T0 + timedelta(minutes=1))
+    clock = Clock(T0 + timedelta(minutes=5))
+    stop = asyncio.Event()
+    emitted = []
+
+    async def sleep(d):
+        clock.t += timedelta(seconds=d)
+        if clock.t >= T0 + timedelta(minutes=20):
+            stop.set()
+
+    async def sink(points):
+        emitted.append(points)
+
+    c = AisStreamCollector(KEY, tracker=t, clock=clock, sleep=sleep)
+    c._ws = FakeWS([], pong=False)
+    await c._tick(sink, stop)
+    assert emitted == []
+    assert c._ws.pings == 2
+
+
+async def test_no_live_socket_means_no_slot():
+    # Even if the tracker thinks it is live, a slot needs a socket to confirm it.
+    t = Tracker()
+    t.connected(T0 - timedelta(minutes=1))
+    clock = Clock(T0 + timedelta(minutes=5))
+    stop = asyncio.Event()
+    emitted = []
+
+    async def sleep(d):
+        clock.t += timedelta(seconds=d)
+        stop.set()
+
+    async def sink(points):
+        emitted.append(points)
+
+    c = AisStreamCollector(KEY, tracker=t, clock=clock, sleep=sleep)
+    await c._tick(sink, stop)
+    assert emitted == []

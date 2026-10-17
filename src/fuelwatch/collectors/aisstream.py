@@ -12,7 +12,19 @@ next to the polled `fetch()` collectors:
 
 `sink` is an async callable that receives the four points for each
 completed 10-minute slot. Slots the stream did not fully cover produce no
-call at all, never zeros. Parsing is a pure function, `parse_frame`, so unit
+call at all, never zeros.
+
+Liveness comes from the websocket protocol, not from traffic. Hormuz is
+often quiet for many minutes, so silence is normal and never triggers a
+reconnect: the websockets keepalive pings every PING_INTERVAL seconds and
+closes the connection if a pong takes longer than PING_TIMEOUT. A quiet slot
+on a healthy connection is a real zero. Because a dead socket is only
+noticed when a ping fails, each slot is also confirmed with a ping sent at
+its end: the slot's points go to the sink only if that pong comes back, so a
+connection that died late in a slot never yields zeros for it. A long
+silence is surfaced as `status.note`, without reconnecting.
+
+Parsing is a pure function, `parse_frame`, so unit
 tests run against the hand-built fixtures in tests/fixtures/aisstream/.
 
 Docs: https://aisstream.io/documentation and the message schema at
@@ -53,7 +65,9 @@ URL = "wss://stream.aisstream.io/v0/stream"
 ENV_KEY = "AISSTREAM_API_KEY"
 MESSAGE_TYPES = ["PositionReport", "ShipStaticData"]
 MAX_FRAME_BYTES = 16 * 1024  # real messages are about 1 KB
-SILENCE_TIMEOUT = 120.0  # Hormuz is never quiet for two minutes; treat it as a dead socket
+PING_INTERVAL = 20.0  # websockets keepalive: send a ping this often
+PING_TIMEOUT = 20.0  # and drop the connection if its pong takes longer than this
+QUIET_NOTE_AFTER = timedelta(minutes=30)  # note a long silence in status; never reconnect over it
 BACKOFF_START = 1.0
 BACKOFF_MAX = 300.0
 STABLE_AFTER = 60.0  # a connection that lasted this long resets the backoff
@@ -195,6 +209,8 @@ class AisStatus:
     error_class: str | None = None
     message: str | None = None
     reconnects: int = 0
+    last_message_at: datetime | None = None  # last AIS frame we could parse
+    note: str | None = None  # informational, e.g. a long silence on a healthy connection
 
 
 def _utcnow() -> datetime:
@@ -225,6 +241,7 @@ class AisStreamCollector:
         self._clock = clock
         self._sleep = sleep
         self.status = AisStatus()
+        self._ws = None  # the socket of the current live session, for slot-end pings
 
     @classmethod
     def from_env(cls, **kw) -> AisStreamCollector | None:
@@ -258,12 +275,41 @@ class AisStreamCollector:
             now = self._clock()
             boundary = slot_start(now) + SLOT
             await self._sleep(max(0.0, (boundary - now).total_seconds()))
+            # Count first, so frames arriving while the ping is in flight
+            # belong to the next slot; then confirm the socket was alive.
             points = self.tracker.close_slot(boundary)
+            if points and not await self._alive_through(boundary):
+                log.info("AIS slot %s dropped: no pong at slot end", boundary.isoformat())
+                points = []
+            self._note_silence(self._clock())
             if points:
                 try:
                     await sink(points)
                 except Exception:
                     log.exception("AIS sink failed for slot %s", boundary.isoformat())
+
+    async def _alive_through(self, boundary: datetime) -> bool:
+        """True if the live socket answers a ping sent after `boundary`. The
+        pong proves every frame the server sent before it has arrived, so the
+        connection was healthy up to the end of the slot."""
+        ws = self._ws
+        if ws is None or not self.tracker.live:
+            return False
+        try:
+            pong = await ws.ping()
+            await asyncio.wait_for(pong, timeout=PING_TIMEOUT)
+        except (ConnectionClosed, TimeoutError):
+            return False
+        # A failure noticed meanwhile still sinks the slot.
+        return self._ws is ws and self.tracker.live
+
+    def _note_silence(self, now: datetime) -> None:
+        last = self.status.last_message_at
+        if self.status.connected and last is not None and now - last >= QUIET_NOTE_AFTER:
+            minutes = int((now - last).total_seconds() // 60)
+            self.status.note = f"connected, but no AIS messages for {minutes} minutes"
+        else:
+            self.status.note = None
 
     async def _stream(self, stop: asyncio.Event) -> None:
         delay = BACKOFF_START
@@ -286,29 +332,47 @@ class AisStreamCollector:
             delay = min(delay * 2, BACKOFF_MAX)
 
     def _fail(self, error_class: str, message: str) -> None:
+        self._ws = None
         self.tracker.disconnected(self._clock())
         self.status.connected = False
+        self.status.note = None
         self.status.error_class = error_class
         self.status.message = redact(message)[:300]
         log.warning("AISStream %s: %s", error_class, self.status.message)
 
     async def _session(self, stop: asyncio.Event) -> None:
         async with self._connect(
-            self._url, compression="deflate", max_size=2**20, open_timeout=10
+            self._url,
+            compression="deflate",
+            max_size=2**20,
+            open_timeout=10,
+            ping_interval=PING_INTERVAL,
+            ping_timeout=PING_TIMEOUT,
         ) as ws:
             # AISStream closes the socket if the subscription is not sent within 3 s.
             await ws.send(subscription(self._key, self.tracker.bbox))
-            while not stop.is_set():
-                raw = await asyncio.wait_for(ws.recv(), timeout=SILENCE_TIMEOUT)
-                now = self._clock()
-                msg = parse_frame(raw)
-                if isinstance(msg, ErrorMsg):
-                    raise ProviderError("provider_error", msg.text)
-                if msg is None:
-                    continue
-                if not self.tracker.live:
-                    self.tracker.connected(now)
-                    self.status.connected = True
-                    self.status.error_class = self.status.message = None
-                apply(self.tracker, msg, now)
+            try:
+                while not stop.is_set():
+                    # No timeout here: silence is normal at Hormuz. A dead
+                    # socket fails the keepalive ping and recv() raises
+                    # ConnectionClosed.
+                    raw = await ws.recv()
+                    now = self._clock()
+                    msg = parse_frame(raw)
+                    if isinstance(msg, ErrorMsg):
+                        raise ProviderError("provider_error", msg.text)
+                    if msg is None:
+                        continue
+                    self.status.last_message_at = now
+                    self.status.note = None
+                    if not self.tracker.live:
+                        # The subscription confirmation (or the first data
+                        # frame) shows the subscription was accepted.
+                        self.tracker.connected(now)
+                        self._ws = ws
+                        self.status.connected = True
+                        self.status.error_class = self.status.message = None
+                    apply(self.tracker, msg, now)
+            finally:
+                self._ws = None
             await ws.close()
