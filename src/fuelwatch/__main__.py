@@ -3,9 +3,12 @@
     python -m fuelwatch backup [DEST]        consistent copy of the database
     python -m fuelwatch backfill [--reset]   run the five-year backfill now
     python -m fuelwatch collect --once       poll every collector once
+    python -m fuelwatch serve                run the app (API, collectors, /metrics)
 
 The nightly backup timer runs ``backup`` inside the container. ``backfill``
 and ``collect --once`` are manual one-offs; the app runs both itself.
+``serve`` binds FW_HOST:FW_PORT (default 127.0.0.1:8080) on exactly one
+Uvicorn worker; see fuelwatch.app for the other settings.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -130,6 +134,30 @@ async def _collect_once(args) -> int:
     return 0 if all(r.error is None for r in results) else 1
 
 
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8080
+
+
+def _serve() -> int:
+    import uvicorn
+
+    from fuelwatch.app import env_port
+
+    host = os.environ.get("FW_HOST", "").strip() or DEFAULT_HOST
+    port = env_port("FW_PORT", DEFAULT_PORT)
+    uvicorn.run(
+        "fuelwatch.app:create_app",
+        factory=True,
+        host=host,
+        port=port,
+        workers=1,  # the spec requires exactly one: collectors and AIS live in this process
+        log_config=None,  # keep our logging, and its redaction filter, for uvicorn too
+        server_header=False,
+        timeout_graceful_shutdown=10,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     from fuelwatch.registry import REGISTRY
 
@@ -156,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     c = sub.add_parser("collect", help="poll the collectors")
     c.add_argument("--once", action="store_true", required=True, help="poll each once and exit")
     c.add_argument("--only", action="append", choices=names, help="limit to a collector")
+    sub.add_parser("serve", help="run the app: API, collectors and /metrics")
     args = parser.parse_args(argv)
     if getattr(args, "accept_missing", False) and not args.only:
         parser.error("--accept-missing needs --only COLLECTOR")
@@ -167,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"backup written to {out}")
         return 0
     _setup_logging(args.verbose)
+    if args.command == "serve":
+        return _serve()
     if args.command == "backfill":
         return asyncio.run(_backfill(args))
     return asyncio.run(_collect_once(args))

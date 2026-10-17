@@ -322,6 +322,22 @@ async def test_polling_waits_for_backfill(store, client):
     assert store.get_backfill("eia").state == BackfillState.DONE
 
 
+async def test_collections_counts_runs_that_wrote(store, client):
+    """The API caches /api/summary until this changes."""
+    f = Fake([brent(day(2026, 10, 13))])
+    s = fast(store, client, [like("eia", f)], run_backfill=True)
+    assert s.collections == 0
+    stop = asyncio.Event()
+    task = asyncio.create_task(s.run(stop))
+    await until(lambda: len(f.calls) >= 2)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert s.collections >= 2  # the backfill, then at least one poll
+    failing = fast(store, client, [like("eia", Fake(error=ProviderError("x", "y")))])
+    await failing.poll(failing.collectors[0])
+    assert failing.collections == 0
+
+
 class Hanging:
     """A fetch that never returns until released."""
 
