@@ -123,15 +123,25 @@ def test_retail_normal_week():
 
 
 def test_retail_holiday_week_is_not_flagged_early():
-    # Columbus Day Mon Oct 12, 2026: release slips to Tue, plus one business
-    # day for the holiday week and the normal one: late only after Thu 22:00.
+    # Columbus Day Mon Oct 12, 2026: the expected release moves two business
+    # days to Wed Oct 14 (when it really came out); late after Thu 22:00.
     have = day(2026, 10, 5)
     f = freshness(RETAIL, have, at(2026, 10, 13, 23))
     assert f.status == OK
-    assert f.expected_publication == at(2026, 10, 13, 22)
+    assert f.expected_publication == at(2026, 10, 14, 22)
+    assert f.deadline == at(2026, 10, 15, 22)
     assert freshness(RETAIL, have, at(2026, 10, 14, 23)).status == OK
     assert freshness(RETAIL, have, at(2026, 10, 15, 21)).status == OK
     assert freshness(RETAIL, have, at(2026, 10, 15, 22, 1)).status == LATE
+
+
+def test_retail_memorial_day_week():
+    # Mon May 25 2026: expected Wed May 27, late after Thu May 28 22:00.
+    have = day(2026, 5, 18)
+    f = freshness(RETAIL, have, at(2026, 5, 26, 23))
+    assert f.expected_publication == at(2026, 5, 27, 22)
+    assert f.status == OK
+    assert freshness(RETAIL, have, at(2026, 5, 28, 22, 1)).status == LATE
 
 
 def test_retail_year_boundary():

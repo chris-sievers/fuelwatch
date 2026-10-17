@@ -13,12 +13,13 @@ Grace follows the spec: one business day for EIA, two days for PortWatch
 and the EU bulletin (the collectors' SeriesSpec.grace), one hour for live
 AIS. Business days skip weekends and US federal holidays (observed dates).
 
-EIA slips a release by a business day for each federal holiday that falls
-between Monday and the release day of that week (a Monday holiday moves the
-Monday retail release to Tuesday and the Wednesday WPSR to Thursday). The
-retail release can slip further, so a holiday week gets one more business
-day of grace there. PortWatch and the EU bulletin have no holiday rule:
-their two-day grace absorbs a one-day slip.
+Grace always counts from the expected release. A federal holiday in the
+week moves EIA's expected release later: for the WPSR and spot prices by
+one business day per holiday between Monday and the Wednesday release (a
+Labor Day Monday moves it to Thursday); for retail, a holiday on the
+Monday survey day moves it by up to two business days (Columbus Day 2026:
+the Oct 12 survey came out Wed Oct 14). PortWatch and the EU bulletin have
+no holiday rule: their two-day grace absorbs a one-day slip.
 """
 
 from __future__ import annotations
@@ -111,8 +112,9 @@ class Schedule:
     period_business_day: bool = False
     grace: timedelta = timedelta(0)  # calendar grace
     grace_business_days: int = 0  # business-day grace, added to `grace`
-    holiday_slip: bool = False
-    holiday_extra_grace_days: int = 0  # more business days of grace in a slipped week
+    # Business days the release moves later for each federal holiday between
+    # Monday and the scheduled release day of that week (0: no holiday rule).
+    holiday_slip_days: int = 0
     interval: timedelta | None = None
 
 
@@ -132,18 +134,16 @@ def release_for_week(s: Schedule, monday: date) -> Release:
         while not is_business_day(period):
             period -= timedelta(days=1)
     day = anchor
-    slipped = 0
-    if s.holiday_slip:
-        slipped = sum(
+    if s.holiday_slip_days:
+        holidays = sum(
             1 for i in range(s.weekday + 1) if is_federal_holiday(monday + timedelta(days=i))
         )
-        for _ in range(slipped):
+        for _ in range(holidays * s.holiday_slip_days):
             day = add_business_days(day, 1)
         while not is_business_day(day):
             day += timedelta(days=1)
     at = datetime.combine(day, s.release_time, UTC)
-    grace_days = s.grace_business_days + (s.holiday_extra_grace_days if slipped else 0)
-    due = datetime.combine(add_business_days(day, grace_days), s.release_time, UTC)
+    due = datetime.combine(add_business_days(day, s.grace_business_days), s.release_time, UTC)
     return Release(at, period, due + s.grace)
 
 
@@ -232,7 +232,7 @@ SCHEDULES: dict[str, Schedule] = {
         period_offset_days=-1,
         period_business_day=True,
         grace_business_days=1,
-        holiday_slip=True,
+        holiday_slip_days=1,
     ),
     # Retail survey of Monday's prices, released Monday about 5 pm ET.
     eia._RETAIL_SCHEDULE: Schedule(
@@ -241,8 +241,7 @@ SCHEDULES: dict[str, Schedule] = {
         release_time=time(22, 0),
         period_offset_days=0,
         grace_business_days=1,
-        holiday_slip=True,
-        holiday_extra_grace_days=1,
+        holiday_slip_days=2,
     ),
     # WPSR, Wednesday 10:30 ET (15:30 UTC in winter), week ending Friday.
     eia._WPSR_SCHEDULE: Schedule(
@@ -251,7 +250,7 @@ SCHEDULES: dict[str, Schedule] = {
         release_time=time(15, 30),
         period_offset_days=-5,
         grace_business_days=1,
-        holiday_slip=True,
+        holiday_slip_days=1,
     ),
     # Tuesday about 13:00 UTC, data through the Sunday before.
     portwatch._SCHEDULE: Schedule(
