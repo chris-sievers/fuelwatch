@@ -43,9 +43,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import random
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -63,6 +63,7 @@ from fuelwatch.collectors.ais_tracker import (
     BBox,
     ShipPosition,
     Tracker,
+    finite,
     slot_start,
 )
 from fuelwatch.http import ProviderError, redact
@@ -179,12 +180,13 @@ def parse_frame(raw: bytes | str) -> Parsed | None:
         return None
     try:
         doc = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
-        return None
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None  # RecursionError: nesting deeper than the decoder allows
     if not isinstance(doc, dict):
         return None
     if "error" in doc:  # AISStream reports a bad key or subscription this way
-        return ErrorMsg(str(doc["error"])[:200])
+        err = doc["error"]
+        return ErrorMsg(err[:200] if isinstance(err, str) else "unreadable error message")
     mtype = doc.get("MessageType")
     message = doc.get("Message")
     if mtype == "SubscriptionConfirmation":
@@ -214,23 +216,21 @@ def parse_frame(raw: bytes | str) -> Parsed | None:
     )
 
 
-def _in_box(bbox: BBox, lat: object, lon: object) -> bool:
-    ok = all(
-        isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
-        for v in (lat, lon)
-    )
-    return ok and bbox.contains(float(lat), float(lon))
-
-
 def apply(tracker: Tracker, msg: Parsed | None, now: datetime) -> bool:
     """Feed one message to the tracker. Positions outside its box are dropped
-    by the tracker; static data is kept only for ships it already tracks or
-    whose MetaData position is in its box, so wide-box ships never enter the
-    tracker's table (or its 5,000-ship cap)."""
+    by the tracker. Static data with a usable MetaData position is kept only
+    if that position is in the box, even for a tracked ship; without one, only
+    for a ship already tracked. So wide-box ships never enter the tracker's
+    table (or its 5,000-ship cap), and the tracker never lets static data
+    renew a ship (see Tracker.static)."""
     if isinstance(msg, PositionMsg):
         return tracker.position(msg.mmsi, msg.lat, msg.lon, now, msg.sog, msg.cog, msg.heading)
     if isinstance(msg, StaticMsg):
-        if not tracker.knows(msg.mmsi) and not _in_box(tracker.bbox, msg.lat, msg.lon):
+        lat, lon = finite(msg.lat), finite(msg.lon)
+        if lat is not None and lon is not None:
+            if not tracker.bbox.contains(lat, lon):
+                return False
+        elif not tracker.knows(msg.mmsi):
             return False
         return tracker.static(msg.mmsi, msg.ship_type, msg.name, now)
     return False
@@ -280,6 +280,7 @@ class AisStreamCollector:
         self._ws = None  # the socket of the current live session, for slot-end pings
         self._feed_bbox = feed_bbox
         self._feed: dict[datetime, int] = {}  # data frames received, per slot start
+        self._last_closed: datetime | None = None  # the latest slot end the ticker closed
 
     @classmethod
     def from_env(cls, **kw) -> AisStreamCollector | None:
@@ -315,16 +316,25 @@ class AisStreamCollector:
             exc = None if task.cancelled() else task.exception()
             if exc is not None:
                 name = "ticker" if task is tasks[0] else "stream"
+                # Status gets the type name only, as the store does for internal
+                # errors: the text may hold anything. The details go to the log.
                 self.status.error_class = "internal"
-                self.status.message = redact(f"{name} failed: {type(exc).__name__}: {exc}")[:300]
-                log.error("AISStream %s", self.status.message)
+                self.status.message = f"{name} failed: {type(exc).__name__}"
+                details = redact("".join(traceback.format_exception(exc)))
+                log.error("AISStream %s\n%s", self.status.message, details)
                 raise exc
 
     async def _tick(self, sink: Sink, stop: asyncio.Event) -> None:
         while not stop.is_set():
-            now = self._clock()
-            boundary = slot_start(now) + SLOT
-            await self._sleep(max(0.0, (boundary - now).total_seconds()))
+            boundary = slot_start(self._clock()) + SLOT
+            if self._last_closed is not None and boundary <= self._last_closed:
+                # The wall clock stepped back: never close a slot twice.
+                boundary = self._last_closed + SLOT
+            # Sleep until the clock really reads the boundary; a sleep can end
+            # early by the clock's reckoning if the clock was stepped meanwhile.
+            while (now := self._clock()) < boundary:
+                await self._sleep((boundary - now).total_seconds())
+            self._last_closed = boundary
             # Count first, so frames arriving while the ping is in flight
             # belong to the next slot; then confirm the socket was alive.
             points = self.tracker.close_slot(boundary)
@@ -417,7 +427,11 @@ class AisStreamCollector:
                     # ConnectionClosed.
                     raw = await ws.recv()
                     now = self._clock()
-                    msg = parse_frame(raw)
+                    try:
+                        msg = parse_frame(raw)
+                    except Exception as e:  # noqa: BLE001 - one bad frame must not end the socket
+                        log.warning("AISStream frame skipped: %s", type(e).__name__)
+                        continue
                     if isinstance(msg, ErrorMsg):
                         raise ProviderError("provider_error", msg.text)
                     if msg is None:
@@ -433,7 +447,10 @@ class AisStreamCollector:
                         self._ws = ws
                         self.status.connected = True
                         self.status.error_class = self.status.message = None
-                    apply(self.tracker, msg, now)
+                    try:
+                        apply(self.tracker, msg, now)
+                    except Exception as e:  # noqa: BLE001 - as above
+                        log.warning("AISStream message skipped: %s", type(e).__name__)
             finally:
                 self._ws = None
             await ws.close()

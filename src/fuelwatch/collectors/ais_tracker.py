@@ -135,7 +135,9 @@ def valid_mmsi(value: object) -> str | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        s = str(value)
+        if not 0 <= value < 10**9:  # also keeps str() away from huge ints
+            return None
+        s = str(value).zfill(9)
     elif isinstance(value, str):
         s = value.strip()
     else:
@@ -147,10 +149,15 @@ def valid_mmsi(value: object) -> str | None:
     return s
 
 
-def _finite(value: object) -> float | None:
+def finite(value: object) -> float | None:
+    """A finite float from an untrusted JSON number, else None. Never raises:
+    JSON integers can be too large for a float."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    f = float(value)
+    try:
+        f = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
     return f if math.isfinite(f) else None
 
 
@@ -254,7 +261,7 @@ class Tracker:
     # ingest
 
     def knows(self, mmsi: object) -> bool:
-        """True if this MMSI is in the table (heard in the box recently)."""
+        """True if this MMSI is in the table (heard in the box within the expiry)."""
         key = valid_mmsi(mmsi)
         return key is not None and key in self._ships
 
@@ -291,15 +298,15 @@ class Tracker:
     ) -> bool:
         """Apply a position report. Returns False if it was dropped."""
         key = valid_mmsi(mmsi)
-        flat, flon = _finite(lat), _finite(lon)
+        flat, flon = finite(lat), finite(lon)
         if key is None or flat is None or flon is None or not self.bbox.contains(flat, flon):
             return False
         ship = self._touch(key, now)
         prev = (ship.lat, ship.lon, ship.pos_at)
         ship.lat, ship.lon, ship.pos_at = flat, flon, now
-        s = _finite(sog)
+        s = finite(sog)
         ship.sog = s if s is not None and 0 <= s < 102.3 else None  # 102.3 = not available
-        c = _finite(cog)
+        c = finite(cog)
         ship.cog = c if c is not None and 0 <= c < 360 else None  # 360 = not available
         ship.heading = heading if isinstance(heading, int) and 0 <= heading < 360 else None
         if prev[2] is not None:
@@ -307,11 +314,17 @@ class Tracker:
         return True
 
     def static(self, mmsi: object, ship_type: object, name: object, now: datetime) -> bool:
-        """Apply ship static data. Returns False if it was dropped."""
+        """Apply ship static data. Returns False if it was dropped.
+
+        Static data never refreshes a known ship's last-heard time or its
+        place in the eviction order: only in-box positions keep a ship
+        alive, so a ship that has left the box expires on schedule."""
         key = valid_mmsi(mmsi)
         if key is None:
             return False
-        ship = self._touch(key, now)
+        ship = self._ships.get(key)
+        if ship is None:
+            ship = self._touch(key, now)
         if isinstance(ship_type, int) and not isinstance(ship_type, bool) and 0 <= ship_type <= 99:
             ship.ship_type = ship_type
         cleaned = clean_name(name)

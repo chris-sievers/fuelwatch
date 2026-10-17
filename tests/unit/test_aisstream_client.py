@@ -434,15 +434,18 @@ def test_wide_box_ships_never_enter_the_hormuz_tracker():
         assert not apply(t, parse_frame(static_frame(mmsi, *GULF)), T0)
     assert len(t) == 1  # no wide-box ship in the table or against the cap
     assert [s.mmsi for s in t.snapshot(T0)] == ["636019825"]
-    # static data still lands for a tracked ship, wherever MetaData puts it ...
-    assert apply(t, parse_frame(static_frame(636019825, *GULF)), T0)
+    # a usable MetaData position outside the box drops static data, even for
+    # a tracked ship; inside the box it lands ...
+    assert not apply(t, parse_frame(static_frame(636019825, *GULF)), T0)
+    assert apply(t, parse_frame(static_frame(636019825, 26.6, 56.35)), T0)
     assert t.snapshot(T0)[0].tanker
-    # ... and for an untracked ship whose MetaData position is in the box
-    assert apply(t, parse_frame(static_frame(422000999, 26.5, 56.5)), T0)
-    # static data with a missing or junk position is dropped for unknown ships
+    assert apply(t, parse_frame(static_frame(422000999, 26.5, 56.5)), T0)  # untracked, in box
+    # ... and without a usable position it lands only for a tracked ship
+    assert apply(t, StaticMsg(636019825, 80, "X", lat=None, lon=None), T0)
     assert not apply(t, StaticMsg(422000998, 80, "X", lat=None, lon=None), T0)
     assert not apply(t, StaticMsg(422000997, 80, "X", lat=float("nan"), lon=56.5), T0)
     assert not apply(t, StaticMsg(422000996, 80, "X", lat=True, lon=56.5), T0)
+    assert not apply(t, StaticMsg(422000995, 80, "X", lat=10**400, lon=56.5), T0)
 
 
 def test_wide_box_ships_never_reach_hormuz_counts():
@@ -580,7 +583,8 @@ async def test_ticker_crash_ends_run_with_the_error():
     with pytest.raises(RuntimeError, match="websockets changed"):
         await asyncio.wait_for(c.run(sink, stop), timeout=5)
     assert c.status.error_class == "internal"
-    assert c.status.message.startswith("ticker failed: RuntimeError")
+    # type name only, as the store records internal errors; the text goes to the log
+    assert c.status.message == "ticker failed: RuntimeError"
     assert not c.status.connected and not c.tracker.live
 
 
@@ -588,3 +592,156 @@ async def test_no_live_socket_means_no_slot():
     # Even if the tracker thinks it is live, a slot needs a socket to confirm it.
     _, emitted = await tick_one_slot(lambda c: None)
     assert emitted == []
+
+
+# --- ships that leave the box, hostile numbers, clock steps -----------------------------
+
+
+def test_ship_that_left_the_box_expires_despite_static_data():
+    t = Tracker()
+    assert apply(t, parse_frame(pos_frame(636019825, 26.6, 56.35)), T0)  # heard at Hormuz once
+    for k in range(1, 41):  # then four hours of static data from the Persian Gulf
+        at = T0 + k * timedelta(minutes=6)
+        apply(t, parse_frame(static_frame(636019825, *GULF)), at)
+        apply(t, StaticMsg(636019825, 80, "NO POSITION", lat=None, lon=None), at)
+    assert t.snapshot(T0 + timedelta(hours=4)) == ()
+    assert not t.knows(636019825) and len(t) == 0  # expired on schedule
+
+
+def test_static_data_never_renews_a_ship_at_the_cap():
+    t = Tracker(max_ships=2)
+    apply(t, parse_frame(pos_frame(636019825, 26.6, 56.35)), T0)  # A: heard at 12:00, then leaves
+    apply(t, parse_frame(pos_frame(538001234, 26.6, 56.35)), T0 + timedelta(minutes=6))  # B
+    # A keeps sending static data: from the Gulf (dropped) and with no
+    # position (kept, as A is tracked, but it does not renew A)
+    apply(t, parse_frame(static_frame(636019825, *GULF)), T0 + timedelta(minutes=10))
+    assert apply(t, StaticMsg(636019825, 80, "A", lat=None, lon=None), T0 + timedelta(minutes=11))
+    apply(t, parse_frame(pos_frame(422000001, 26.6, 56.35)), T0 + timedelta(minutes=12))  # C
+    # the cap evicts A, the least recently heard in the box, never B
+    assert t.knows(538001234) and t.knows(422000001) and not t.knows(636019825)
+
+
+HUGE = "1" + "0" * 400  # a JSON integer too large for a float
+TOO_LONG = "9" * 4400  # beyond Python's int string-conversion limit
+NESTED = "[" * 300 + "1" + "]" * 300
+JUNK = [
+    HUGE,
+    "-" + HUGE,
+    TOO_LONG,
+    "1e400",
+    "-1e400",
+    "NaN",
+    "Infinity",
+    NESTED,
+    '{"a": {"b": {"c": 1}}}',
+    '"26.6"',
+    "null",
+    "true",
+    "[]",
+    "-1",
+    "0",
+]
+POSITION_FIELDS = ["UserID", "Latitude", "Longitude", "Sog", "Cog", "TrueHeading"]
+STATIC_FIELDS = ["UserID", "Type", "Dimension", "Name"]
+META_FIELDS = ["MMSI", "latitude", "longitude"]
+
+
+def _junk_frame(fixture_name, mtype, where, field, value):
+    doc = json.loads(fixture(fixture_name))
+    target = doc["MetaData"] if where == "meta" else doc["Message"][mtype]
+    target[field] = "@@JUNK@@"
+    return json.dumps(doc).replace('"@@JUNK@@"', value).encode()
+
+
+def _all_junk_frames():
+    for value in JUNK:
+        for field in POSITION_FIELDS:
+            yield _junk_frame("position_report.json", "PositionReport", "body", field, value)
+        for field in STATIC_FIELDS:
+            yield _junk_frame("ship_static_data.json", "ShipStaticData", "body", field, value)
+        for field in META_FIELDS:
+            for name, mtype in [
+                ("position_report.json", "PositionReport"),
+                ("ship_static_data.json", "ShipStaticData"),
+            ]:
+                yield _junk_frame(name, mtype, "meta", field, value)
+        yield f'{{"error": {value}}}'.encode()
+        yield f'{{"MessageType": {value}, "Message": {value}}}'.encode()
+    yield ("[" * 5000 + "]" * 5000).encode()  # nesting deeper than the decoder allows
+    yield ('{"a":' * 3000 + "1" + "}" * 3000).encode()
+
+
+def test_hostile_numbers_never_raise_from_parse_or_apply():
+    t = Tracker()
+    t.connected(T0 - timedelta(minutes=1))
+    apply(t, parse_frame(fixture("position_report.json")), T0)  # so static data has a known ship
+    frames = list(_all_junk_frames())
+    assert len(frames) > 200
+    for raw in frames:
+        msg = parse_frame(raw)  # must not raise
+        apply(t, msg, T0 + timedelta(minutes=1))  # must not raise
+    t.snapshot(T0 + timedelta(minutes=2))
+    t.close_slot(T0 + timedelta(minutes=10))
+    assert all(s.mmsi == "636019825" for s in t.snapshot(T0 + timedelta(minutes=2)))
+
+
+async def test_one_bad_frame_never_takes_the_socket_down(monkeypatch):
+    def boom(raw):
+        raise OverflowError("int too large to convert to float")
+
+    ws = FakeWS([fixture("subscription_confirmation.json"), b"x", fixture("position_report.json")])
+    stop = asyncio.Event()
+
+    async def sleep(d):
+        stop.set()
+
+    c = AisStreamCollector(KEY, connect=lambda u, **k: ws, sleep=sleep)
+    real = aisstream.parse_frame
+    monkeypatch.setattr(
+        aisstream, "parse_frame", lambda raw: boom(raw) if raw == b"x" else real(raw)
+    )
+    await c._stream(stop)
+    assert len(c.snapshot()) == 1  # the frame after the bad one was still applied
+    assert c.status.error_class == "transport"  # only the socket's own end stopped it
+
+
+async def test_clock_step_backward_never_closes_a_slot_twice():
+    t = Tracker()
+    t.connected(T0 - timedelta(minutes=1))
+    clock = Clock(T0 + timedelta(minutes=5))
+    closes = []
+    real_close = t.close_slot
+
+    def close_slot(end):
+        closes.append((end, clock.t))
+        return real_close(end)
+
+    t.close_slot = close_slot
+    stop = asyncio.Event()
+    emitted = []
+    sleeps = []
+
+    async def sleep(d):
+        sleeps.append(d)
+        step = timedelta(seconds=d)
+        if len(sleeps) == 1:
+            step -= timedelta(seconds=0.3)  # clock stepped back 0.3 s during the sleep
+        clock.t += step
+
+    async def sink(points):
+        emitted.append(points)
+        if len(emitted) == 1:
+            clock.t -= timedelta(seconds=30)  # and a bigger step back right after a close
+        else:
+            stop.set()
+
+    c = AisStreamCollector(KEY, tracker=t, clock=clock, sleep=sleep)
+    c._ws = FakeWS([])
+    c._feed = {T0: 5, T0 + timedelta(minutes=10): 5}
+    await asyncio.wait_for(c._tick(sink, stop), timeout=2)
+
+    ends = [end for end, _ in closes]
+    assert ends == [T0 + timedelta(minutes=10), T0 + timedelta(minutes=20)]  # each once
+    assert all(at >= end for end, at in closes)  # never closed before its end
+    assert [pts[0].period_end for pts in emitted] == ends
+    assert c.status.error_class is None  # no spurious feed_stalled
