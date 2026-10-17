@@ -14,6 +14,7 @@ gaps are missing rows. Empty, null, non-numeric and zero values are also
 treated as gaps; nothing is ever filled with zero.
 """
 
+import asyncio
 import logging
 import math
 import os
@@ -281,7 +282,7 @@ async def fetch_group(
     offset = 0
     while True:
         doc = await get_json(client, url, **query_params(group, key, start, offset))
-        page = parse_response(doc, group)
+        page = await asyncio.to_thread(parse_response, doc, group)  # off the event loop
         points.extend(page)
         n = len(doc["response"]["data"])  # parse_response has checked the shape
         offset += n
