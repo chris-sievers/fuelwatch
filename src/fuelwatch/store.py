@@ -18,12 +18,15 @@ Time model
     both ends. Every list comes back oldest first.
 
 Threading
-    One connection per thread (``threading.local``). The app calls the store
-    from ``asyncio.to_thread`` workers and each worker thread gets its own
-    connection, so no connection is ever shared between threads. WAL lets
-    readers run while a write is in progress; writes take ``BEGIN IMMEDIATE``
-    and wait up to ``busy_timeout`` for the single write lock, so concurrent
-    writers queue instead of failing.
+    One connection per thread. The app calls the store from worker threads
+    (``asyncio.to_thread``, and Starlette's anyio pool for sync endpoints),
+    and each thread gets its own connection, so no connection is ever shared.
+    Worker pools retire idle threads, so connections are tracked by owning
+    thread and those of finished threads are closed whenever a new thread
+    opens one: the count stays at the live threads plus any that finished
+    since the last open. WAL lets readers run while a write is in progress;
+    writes take ``BEGIN IMMEDIATE`` and wait up to ``busy_timeout`` for the
+    single write lock, so concurrent writers queue instead of failing.
 
 Migrations
     Additive only: each migration is a list of statements, checked for
@@ -48,6 +51,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Self
 
+from fuelwatch.collectors.ais_tracker import (
+    SERIES_CROSSINGS,
+    SERIES_SHIPS,
+    SERIES_TANKER_CROSSINGS,
+    SERIES_TANKERS,
+)
 from fuelwatch.http import ProviderError, redact
 from fuelwatch.models import Point
 
@@ -103,6 +112,17 @@ MIGRATIONS: list[list[str]] = [
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
+def _rollback(conn: sqlite3.Connection) -> None:
+    """Roll back if a transaction is still open. SQLite may already have
+    rolled back on its own (a full disk, say); a failure here must never
+    replace the error that got us here, so it is only logged."""
+    if conn.in_transaction:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            log.warning("rollback failed", exc_info=True)
+
+
 class DestructiveMigrationError(RuntimeError):
     """A migration tried to drop, delete, update or rename something."""
 
@@ -153,7 +173,7 @@ def migrate(conn: sqlite3.Connection, migrations: Sequence[Sequence[str]] = MIGR
         )
         conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        _rollback(conn)
         raise
     log.info("database schema migrated from v%d to v%d", current, target)
     return target
@@ -188,13 +208,32 @@ class CollectorStatus:
 
 @dataclass(frozen=True)
 class DailyPoint:
-    """One UTC day of an intraday series: the mean of its slots."""
+    """One UTC day of a 10-minute AIS series: the mean of its slots for ship
+    counts, the sum for crossings. A day with fewer than SLOTS_PER_DAY slots
+    is partial: an outage or the stream starting part-way through."""
 
     series: str
     day: date
     value: float
-    slots: int  # how many 10-minute slots the day has; 144 is a full day
+    slots: int  # how many 10-minute slots the day has
     provisional: bool
+
+    @property
+    def partial(self) -> bool:
+        return self.slots < SLOTS_PER_DAY
+
+
+SLOTS_PER_DAY = 144
+
+# How daily_rollup combines a day's slots, per 10-minute series. Ship counts
+# are a level (ships heard in the slot), so a day is their mean; crossings
+# are events per slot, so a day is their sum. Only these series roll up.
+ROLLUP = {
+    SERIES_SHIPS: "AVG",
+    SERIES_TANKERS: "AVG",
+    SERIES_CROSSINGS: "SUM",
+    SERIES_TANKER_CROSSINGS: "SUM",
+}
 
 
 @dataclass(frozen=True)
@@ -204,10 +243,31 @@ class Settings:
     tank_gallons: float
 
 
+def _parse_reference_date(text: str) -> date:
+    d = date.fromisoformat(text.strip())
+    if not date(1970, 1, 1) <= d <= datetime.now(UTC).date():
+        raise ValueError(f"reference_date must be a past date, got {d}")
+    return d
+
+
+def _parse_baseline_days(text: str) -> int:
+    n = int(text.strip())
+    if not 7 <= n <= 365:
+        raise ValueError(f"baseline_days must be 7 to 365, got {n}")
+    return n
+
+
+def _parse_tank_gallons(text: str) -> float:
+    g = float(text.strip())
+    if not (math.isfinite(g) and 1 <= g <= 100):
+        raise ValueError(f"tank_gallons must be 1 to 100, got {text!r}")
+    return g
+
+
 _SETTING_PARSERS = {
-    "reference_date": date.fromisoformat,
-    "baseline_days": int,
-    "tank_gallons": float,
+    "reference_date": _parse_reference_date,
+    "baseline_days": _parse_baseline_days,
+    "tank_gallons": _parse_tank_gallons,
 }
 
 
@@ -239,6 +299,14 @@ def _check_instant(t: datetime, what: str) -> None:
         raise TypeError(f"{what} must be a datetime")
     if t.tzinfo is None or t.utcoffset() != timedelta(0):
         raise ValueError(f"{what} must be timezone-aware UTC")
+
+
+def _at(at: datetime | None) -> int:
+    """Epoch seconds for an event time: now, or a timezone-aware UTC `at`."""
+    if at is None:
+        return _epoch(datetime.now(UTC))
+    _check_instant(at, "at")
+    return _epoch(at)
 
 
 def _lower(bound: date | datetime | None) -> int | None:
@@ -305,7 +373,7 @@ class Store:
         self.path = Path(path) if path is not None else default_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
-        self._conns: list[sqlite3.Connection] = []
+        self._conns: dict[threading.Thread, sqlite3.Connection] = {}
         self._lock = threading.Lock()
         self._closed = False
         self.schema_version = migrate(self._conn())
@@ -315,12 +383,21 @@ class Store:
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
         if conn is not None:
-            return conn
-        if self._closed:
+            if not self._closed:
+                return conn
+            # close() never closes a live thread's connection (closing one
+            # that another thread is using can crash the interpreter), so
+            # each thread closes its own on its next call.
+            self._local.conn = None
+            conn.close()
             raise RuntimeError("store is closed")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("store is closed")
         # isolation_level=None: no implicit transactions; we BEGIN explicitly.
-        # check_same_thread=False only so close() can close every thread's
-        # connection; each connection is otherwise used by its own thread.
+        # check_same_thread=False only so a finished thread's connection can be
+        # closed by the thread that reaps it; a connection is never used, or
+        # closed, while its own thread is alive.
         conn = sqlite3.connect(
             self.path,
             timeout=BUSY_TIMEOUT_MS / 1000,
@@ -334,19 +411,40 @@ class Store:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA synchronous = NORMAL")  # durable across crashes in WAL mode
-        self._local.conn = conn
+        me = threading.current_thread()
         with self._lock:
-            self._conns.append(conn)
+            if self._closed:  # close() ran while we were connecting
+                conn.close()
+                raise RuntimeError("store is closed")
+            # Reap connections whose thread has finished. Nothing else can be
+            # using them: a connection is only ever used by its own thread.
+            dead = [t for t in self._conns if not t.is_alive()]
+            stale = [self._conns.pop(t) for t in dead]
+            self._conns[me] = conn
+        for old in stale:
+            old.close()
+        self._local.conn = conn
         return conn
 
+    def open_connections(self) -> int:
+        """How many connections the store holds (for tests and /metrics)."""
+        with self._lock:
+            return len(self._conns)
+
     def close(self) -> None:
-        """Close every thread's connection. Call once, at shutdown."""
+        """Close the store. Connections of this thread and of finished threads
+        close now. A live thread's connection is never closed from here, since
+        it may be mid-query; that thread closes it on its next call (which
+        then raises "store is closed"), or it is freed when the thread exits.
+        Calls already in flight finish normally."""
+        me = threading.current_thread()
         with self._lock:
             self._closed = True
-            conns, self._conns = self._conns, []
-        for conn in conns:
-            conn.close()
-        self._local = threading.local()
+            conns, self._conns = self._conns, {}
+        for owner, conn in conns.items():
+            if owner is me or not owner.is_alive():
+                conn.close()
+        self._local.conn = None
 
     def __enter__(self) -> Self:
         return self
@@ -364,7 +462,7 @@ class Store:
                 conn.executemany(sql, rows)
             conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            _rollback(conn)
             raise
 
     # points: writes
@@ -461,12 +559,23 @@ class Store:
     def daily_rollup(
         self, series: str, start: date | None = None, end: date | None = None
     ) -> list[DailyPoint]:
-        """One point per UTC day for a 10-minute series, days start..end
-        inclusive, oldest first. A slot belongs to the day it starts in: points
-        stamped at slot end, so (D 00:00, D+1 00:00]. The value is the mean of
-        the day's slots; missing slots are left out, never counted as zero."""
+        """One point per UTC day for a 10-minute AIS series, days start..end
+        inclusive, oldest first: the mean of the day's slots for ship counts,
+        the sum for crossings (see ROLLUP), with the slot count so partial days
+        can be flagged. Missing slots are left out, never counted as zero.
+
+        A slot belongs to the day it starts in; points are stamped at slot
+        end, so day D is (D 00:00, D+1 00:00]. Only the series in ROLLUP roll
+        up: daily and weekly series sit at midnight of their period date and
+        are read raw with points(). Anything else raises ValueError."""
+        agg = ROLLUP.get(series)
+        if agg is None:
+            raise ValueError(
+                f"daily_rollup is only for 10-minute AIS series, not {series!r}; "
+                "read daily and weekly series with points()"
+            )
         sql = (
-            "SELECT (period_end - 1) / ? AS d, AVG(value), COUNT(*), MAX(provisional) "
+            f"SELECT (period_end - 1) / ? AS d, {agg}(value), COUNT(*), MAX(provisional) "
             "FROM points WHERE series = ?"
         )
         args: list = [DAY, series]
@@ -479,8 +588,8 @@ class Store:
         sql += " GROUP BY d ORDER BY d"
         epoch0 = date(1970, 1, 1)
         return [
-            DailyPoint(series, epoch0 + timedelta(days=d), avg, n, bool(prov))
-            for d, avg, n, prov in self._conn().execute(sql, args)
+            DailyPoint(series, epoch0 + timedelta(days=d), float(v), n, bool(prov))
+            for d, v, n, prov in self._conn().execute(sql, args)
         ]
 
     # status
@@ -488,7 +597,7 @@ class Store:
     def record_success(self, collector: str, at: datetime | None = None) -> None:
         """A run finished without error; clears the last error."""
         _check_name(collector)
-        ts = _epoch(at or datetime.now(UTC))
+        ts = _at(at)
         self._write(
             "INSERT INTO status (collector, last_run_at, last_success_at) VALUES (?, ?, ?) "
             "ON CONFLICT (collector) DO UPDATE SET last_run_at = excluded.last_run_at, "
@@ -508,7 +617,7 @@ class Store:
             error_class, message = error.error_class, _clean_message(str(error))
         else:
             error_class, message = "internal", type(error).__name__
-        ts = _epoch(at or datetime.now(UTC))
+        ts = _at(at)
         self._write(
             "INSERT INTO status (collector, last_run_at, last_error_class, last_error_message) "
             "VALUES (?, ?, ?, ?) "
@@ -566,7 +675,7 @@ class Store:
             raise TypeError("cursor must be str or None")
         if not (isinstance(progress, int | float) and 0.0 <= progress <= 1.0):
             raise ValueError(f"progress must be between 0 and 1, got {progress!r}")
-        ts = _epoch(at or datetime.now(UTC))
+        ts = _at(at)
         self._write(
             "INSERT INTO status (collector, backfill_state, backfill_cursor, "
             "backfill_progress, backfill_updated_at) VALUES (?, ?, ?, ?, ?) "
@@ -584,16 +693,17 @@ class Store:
         return row[0] if row else None
 
     def set_setting(self, key: str, value: str) -> None:
-        """Set a setting. Known settings are checked so a bad value is refused
-        here, not on the next read. The schema version is not a setting."""
+        """Set a setting. The known settings are checked and stored normalized,
+        so a bad value is refused here, not on the next read: reference_date
+        a past ISO date, baseline_days 7 to 365, tank_gallons 1 to 100. The
+        schema version is not a setting."""
         _check_name(key)
         if key == "schema_version":
             raise ValueError("schema_version is managed by migrations")
         value = str(value)
         if parse := _SETTING_PARSERS.get(key):
-            parsed = parse(value)
-            if key != "reference_date" and not (math.isfinite(parsed) and parsed > 0):
-                raise ValueError(f"{key} must be a positive number")
+            parsed = parse(value)  # raises ValueError when out of range
+            value = parsed.isoformat() if isinstance(parsed, date) else str(parsed)
         self._write(
             "INSERT INTO meta (key, value) VALUES (?, ?) "
             "ON CONFLICT (key) DO UPDATE SET value = excluded.value",

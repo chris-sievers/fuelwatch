@@ -1,18 +1,29 @@
 import math
+import os
 import sqlite3
 import threading
+import time
 from datetime import UTC, date, datetime, timedelta, timezone
 
 import pytest
 
 from fuelwatch.__main__ import main as cli_main
+from fuelwatch.collectors.ais_tracker import (
+    SERIES_CROSSINGS,
+    SERIES_SHIPS,
+    SERIES_TANKER_CROSSINGS,
+    SERIES_TANKERS,
+)
 from fuelwatch.http import ProviderError, redact
 from fuelwatch.models import Point
 from fuelwatch.store import (
     MIGRATIONS,
+    ROLLUP,
     SCHEMA_VERSION,
+    SLOTS_PER_DAY,
     BackfillState,
     DestructiveMigrationError,
+    Settings,
     Store,
     check_additive,
     default_path,
@@ -99,10 +110,20 @@ def test_settings_survive_reopen_and_are_not_reseeded(tmp_path):
     "key,value",
     [
         ("reference_date", "27/02/2026"),
+        ("reference_date", "2026-02-30"),
+        ("reference_date", "2099-01-01"),
+        ("reference_date", "1969-12-31"),
         ("baseline_days", "ninety"),
         ("baseline_days", "0"),
+        ("baseline_days", "6"),
+        ("baseline_days", "366"),
+        ("baseline_days", "100000000"),
+        ("baseline_days", "90.5"),
         ("tank_gallons", "-1"),
+        ("tank_gallons", "0.5"),
+        ("tank_gallons", "100.1"),
         ("tank_gallons", "nan"),
+        ("tank_gallons", "inf"),
         ("schema_version", "9"),
         ("Bad Key", "x"),
     ],
@@ -110,7 +131,32 @@ def test_settings_survive_reopen_and_are_not_reseeded(tmp_path):
 def test_bad_settings_refused(store, key, value):
     with pytest.raises(ValueError):
         store.set_setting(key, value)
-    assert store.settings().baseline_days == 90
+    assert store.settings() == Settings(date(2026, 2, 27), 90, 15.0)
+
+
+def test_reference_date_in_the_future_refused(store):
+    tomorrow = datetime.now(UTC).date() + timedelta(days=1)
+    with pytest.raises(ValueError):
+        store.set_setting("reference_date", tomorrow.isoformat())
+    store.set_setting("reference_date", datetime.now(UTC).date().isoformat())  # today is fine
+
+
+@pytest.mark.parametrize(
+    "key,value,stored",
+    [
+        ("baseline_days", " 90 ", "90"),
+        ("baseline_days", "7", "7"),
+        ("baseline_days", "365", "365"),
+        ("tank_gallons", "1", "1.0"),
+        ("tank_gallons", "100", "100.0"),
+        ("tank_gallons", " 12.5", "12.5"),
+        ("reference_date", " 2026-02-27 ", "2026-02-27"),
+    ],
+)
+def test_settings_at_bounds_are_stored_normalized(store, key, value, stored):
+    store.set_setting(key, value)
+    assert store.get_setting(key) == stored
+    store.settings()  # still parses
 
 
 # --- migrations ---------------------------------------------------------------------------
@@ -312,6 +358,20 @@ def test_naive_datetime_rejected_by_model():
 def test_rejects_naive_fetched_at(store):
     with pytest.raises(ValueError):
         store.upsert_points([Point("a", day(2026, 1, 1), 1.0)], fetched_at=datetime(2026, 1, 1))
+
+
+def test_full_disk_error_is_not_hidden_by_rollback(store):
+    """SQLite rolls back by itself on SQLITE_FULL; the original error must
+    still be the one that propagates."""
+    conn = store._conn()
+    conn.execute("PRAGMA max_page_count = 8")
+    pts = [Point("a", day(2026, 1, 1) + timedelta(minutes=10 * i), 1.0) for i in range(20000)]
+    with pytest.raises(sqlite3.OperationalError, match="full"):
+        store.upsert_points(pts)
+    assert not conn.in_transaction
+    conn.execute("PRAGMA max_page_count = 1073741823")
+    store.upsert_points(pts[:10])
+    assert len(store.points("a")) == 10
 
 
 def test_failed_write_rolls_back_and_store_still_works(store, monkeypatch):
@@ -526,28 +586,67 @@ def ais_day(series: str, d: date, values) -> list[Point]:
     ]
 
 
-def test_daily_rollup_mean_of_full_days(store):
+def test_rollup_kinds_come_from_the_ais_tracker():
+    assert ROLLUP == {
+        SERIES_SHIPS: "AVG",
+        SERIES_TANKERS: "AVG",
+        SERIES_CROSSINGS: "SUM",
+        SERIES_TANKER_CROSSINGS: "SUM",
+    }
+    assert SLOTS_PER_DAY == 144
+
+
+@pytest.mark.parametrize("series", [SERIES_SHIPS, SERIES_TANKERS])
+def test_daily_rollup_ship_counts_are_a_daily_mean(store, series):
     d1, d2 = date(2026, 5, 1), date(2026, 5, 2)
     store.upsert_points(
-        ais_day("hormuz_ais_ships", d1, [10] * 72 + [20] * 72)
-        + ais_day("hormuz_ais_ships", d2, range(144))
+        ais_day(series, d1, [10] * 72 + [20] * 72) + ais_day(series, d2, range(144))
     )
-    got = store.daily_rollup("hormuz_ais_ships")
-    assert [(r.day, r.slots) for r in got] == [(d1, 144), (d2, 144)]
+    got = store.daily_rollup(series)
+    assert [(r.day, r.slots, r.partial) for r in got] == [(d1, 144, False), (d2, 144, False)]
     assert got[0].value == 15.0
     assert got[1].value == pytest.approx(71.5)
     assert all(not r.provisional for r in got)
 
 
+@pytest.mark.parametrize("series", [SERIES_CROSSINGS, SERIES_TANKER_CROSSINGS])
+def test_daily_rollup_crossings_are_a_daily_sum(store, series):
+    d = date(2026, 5, 1)
+    store.upsert_points(ais_day(series, d, [0, 1, 2] * 48))
+    (r,) = store.daily_rollup(series)
+    assert (r.day, r.value, r.slots, r.partial) == (d, 144.0, 144, False)
+
+
+def test_daily_rollup_partial_day_is_flagged_not_extrapolated(store):
+    # six slots heard, two crossings: the day reads 2 crossings over 6 slots, never 48
+    store.upsert_points(ais_day(SERIES_CROSSINGS, date(2026, 5, 1), [1, 0, 0, 1, 0, 0]))
+    store.upsert_points(ais_day(SERIES_SHIPS, date(2026, 5, 1), [30, 32, 34, 30, 32, 34]))
+    (crossings,) = store.daily_rollup(SERIES_CROSSINGS)
+    assert (crossings.value, crossings.slots, crossings.partial) == (2.0, 6, True)
+    (ships,) = store.daily_rollup(SERIES_SHIPS)
+    assert (ships.value, ships.slots, ships.partial) == (32.0, 6, True)
+
+
+@pytest.mark.parametrize(
+    "series", ["eia.spot.brent", "portwatch.hormuz.n_total", "eu_pump_diesel_eu", "ais"]
+)
+def test_daily_rollup_refuses_daily_weekly_and_unknown_series(store, series):
+    # a midnight-stamped daily point would land on the previous day
+    store.upsert_points([Point(series, day(2026, 3, 2), 64.0)])
+    with pytest.raises(ValueError, match="10-minute"):
+        store.daily_rollup(series)
+    assert store.points(series, date(2026, 3, 2), date(2026, 3, 2))[0].value == 64.0
+
+
 def test_daily_rollup_slot_ending_at_midnight_belongs_to_previous_day(store):
     store.upsert_points(
         [
-            Point("ais", day(2026, 5, 1, 0, 10), 1.0),  # first slot of May 1
-            Point("ais", day(2026, 5, 2, 0, 0), 3.0),  # 23:50-24:00 on May 1
-            Point("ais", day(2026, 5, 2, 0, 10), 7.0),  # first slot of May 2
+            Point(SERIES_SHIPS, day(2026, 5, 1, 0, 10), 1.0),  # first slot of May 1
+            Point(SERIES_SHIPS, day(2026, 5, 2, 0, 0), 3.0),  # 23:50-24:00 on May 1
+            Point(SERIES_SHIPS, day(2026, 5, 2, 0, 10), 7.0),  # first slot of May 2
         ]
     )
-    got = store.daily_rollup("ais")
+    got = store.daily_rollup(SERIES_SHIPS)
     assert [(r.day, r.value, r.slots) for r in got] == [
         (date(2026, 5, 1), 2.0, 2),
         (date(2026, 5, 2), 7.0, 1),
@@ -557,28 +656,36 @@ def test_daily_rollup_slot_ending_at_midnight_belongs_to_previous_day(store):
 def test_daily_rollup_outage_is_not_zero(store):
     # a 6-hour outage: those slots are missing, and the mean is of the slots heard
     values = [12] * 54 + [None] * 36 + [12] * 54
-    store.upsert_points(ais_day("ais", date(2026, 5, 1), values))
-    (r,) = store.daily_rollup("ais")
-    assert r.value == 12.0
-    assert r.slots == 108
+    store.upsert_points(ais_day(SERIES_SHIPS, date(2026, 5, 1), values))
+    (r,) = store.daily_rollup(SERIES_SHIPS)
+    assert (r.value, r.slots, r.partial) == (12.0, 108, True)
 
 
 def test_daily_rollup_bounds_and_gap_days(store):
     pts = []
     for n in (1, 2, 4, 5):  # May 3 had no data at all
-        pts += ais_day("ais", date(2026, 5, n), [n] * 144)
+        pts += ais_day(SERIES_SHIPS, date(2026, 5, n), [n] * 144)
     store.upsert_points(pts)
-    got = store.daily_rollup("ais", date(2026, 5, 2), date(2026, 5, 4))
+    got = store.daily_rollup(SERIES_SHIPS, date(2026, 5, 2), date(2026, 5, 4))
     assert [(r.day.day, r.value) for r in got] == [(2, 2.0), (4, 4.0)]
-    assert [r.day.day for r in store.daily_rollup("ais", start=date(2026, 5, 5))] == [5]
-    assert [r.day.day for r in store.daily_rollup("ais", end=date(2026, 5, 1))] == [1]
-    assert store.daily_rollup("nope") == []
+    assert [r.day.day for r in store.daily_rollup(SERIES_SHIPS, start=date(2026, 5, 5))] == [5]
+    assert [r.day.day for r in store.daily_rollup(SERIES_SHIPS, end=date(2026, 5, 1))] == [1]
+    assert store.daily_rollup(SERIES_TANKERS) == []
 
 
 def test_daily_rollup_zeros_count(store):
-    store.upsert_points(ais_day("ais", date(2026, 5, 1), [0] * 143 + [144]))
-    (r,) = store.daily_rollup("ais")
-    assert r.value == 1.0
+    store.upsert_points(ais_day(SERIES_SHIPS, date(2026, 5, 1), [0] * 143 + [144]))
+    store.upsert_points(ais_day(SERIES_CROSSINGS, date(2026, 5, 1), [0] * 144))
+    assert store.daily_rollup(SERIES_SHIPS)[0].value == 1.0
+    (r,) = store.daily_rollup(SERIES_CROSSINGS)
+    assert (r.value, r.slots) == (0.0, 144)
+
+
+def test_daily_rollup_provisional_if_any_slot_is(store):
+    pts = ais_day(SERIES_SHIPS, date(2026, 5, 1), [5] * 144)
+    pts[-1] = Point(SERIES_SHIPS, pts[-1].period_end, 5.0, provisional=True)
+    store.upsert_points(pts)
+    assert store.daily_rollup(SERIES_SHIPS)[0].provisional is True
 
 
 # --- status and backfill --------------------------------------------------------------------
@@ -633,6 +740,45 @@ def test_status_failure_never_stores_raw_exceptions(store):
 def test_status_bad_error_class_becomes_internal(store):
     store.record_failure("eia", ProviderError("Not A Class!", "msg"))
     assert store.get_status("eia").error_class == "internal"
+
+
+@pytest.fixture
+def los_angeles(monkeypatch):
+    """Run with the host clock in a non-UTC zone, as a dev laptop might."""
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_status_times_reject_naive_datetimes(store, los_angeles):
+    assert time.localtime().tm_gmtoff != 0  # the zone really is not UTC
+    naive = datetime(2026, 3, 2, 12, 0)
+    with pytest.raises(ValueError, match="UTC"):
+        store.record_success("eia", at=naive)
+    with pytest.raises(ValueError, match="UTC"):
+        store.record_failure("eia", ProviderError("timeout", "slow"), at=naive)
+    with pytest.raises(ValueError, match="UTC"):
+        store.set_backfill("eia", BackfillState.RUNNING, "c", 0.5, at=naive)
+    with pytest.raises(ValueError, match="UTC"):
+        store.record_success(
+            "eia", at=datetime(2026, 3, 2, 12, tzinfo=timezone(timedelta(hours=-8)))
+        )
+    assert store.get_status("eia") is None  # nothing was written
+
+
+def test_status_times_round_trip_exactly_outside_utc(store, los_angeles):
+    at = day(2026, 3, 2, 12)
+    store.record_success("eia", at=at)
+    store.record_failure("pw", ProviderError("timeout", "slow"), at=at)
+    store.set_backfill("pw", BackfillState.RUNNING, "c", 0.5, at=at)
+    assert store.get_status("eia").last_success_at == at
+    assert store.get_status("pw").last_run_at == at
+    assert store.get_backfill("pw").updated_at == at
+    before = datetime.now(UTC).replace(microsecond=0)
+    store.record_success("now")  # default: the current UTC time
+    assert abs(store.get_status("now").last_run_at - before) < timedelta(seconds=5)
 
 
 def test_status_bad_collector_name(store):
@@ -705,14 +851,14 @@ def test_reads_during_writes_from_other_threads(store):
         try:
             while not stop.is_set():
                 store.points("w1")
-                store.latest("w2", 5)
+                store.latest(SERIES_SHIPS, 5)
                 store.series_latest()
-                store.daily_rollup("w1")
+                store.daily_rollup(SERIES_SHIPS)
                 store.value_on("w1", date(2026, 1, 5))
         except BaseException as e:  # noqa: BLE001 - surface any thread error
             errors.append(e)
 
-    writers = [threading.Thread(target=writer, args=(s,)) for s in ("w1", "w2")]
+    writers = [threading.Thread(target=writer, args=(s,)) for s in ("w1", SERIES_SHIPS)]
     readers = [threading.Thread(target=reader) for _ in range(3)]
     for t in readers + writers:
         t.start()
@@ -722,7 +868,7 @@ def test_reads_during_writes_from_other_threads(store):
     for t in readers:
         t.join()
     assert errors == []
-    assert len(store.points("w1")) == len(store.points("w2")) == 4000
+    assert len(store.points("w1")) == len(store.points(SERIES_SHIPS)) == 4000
 
 
 def test_each_thread_has_its_own_connection(store):
@@ -743,6 +889,109 @@ async def test_works_through_asyncio_to_thread(store):
         ]
     )
     assert len(await asyncio.to_thread(store.points, "t")) == 28
+
+
+def open_fds() -> int | None:
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return None
+
+
+def test_connections_of_finished_threads_are_closed(store):
+    """Worker pools retire idle threads; their connections must not pile up."""
+    store.upsert_points([Point("a", day(2026, 1, 1), 1.0)])
+    fds_before = open_fds()
+    for _ in range(200):
+        t = threading.Thread(target=store.latest, args=("a",))
+        t.start()
+        t.join()
+    # the main thread's, plus at most the one thread that finished since the last open
+    assert store.open_connections() <= 2
+    if fds_before is not None:
+        assert open_fds() <= fds_before + 4
+
+
+def test_connections_of_live_threads_are_kept(store):
+    started, release = threading.Barrier(6), threading.Event()
+    seen: list = []
+
+    def worker():
+        seen.append(store._conn())
+        started.wait()
+        release.wait()
+        store.latest("a")  # its connection still works after others opened
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+    for t in threads:
+        t.start()
+    started.wait()
+    assert store.open_connections() == 6  # five workers and the main thread
+    release.set()
+    for t in threads:
+        t.join()
+    assert len({id(c) for c in seen}) == 5
+
+
+def test_thread_pool_churn_stays_bounded(store):
+    from concurrent.futures import ThreadPoolExecutor
+
+    for _ in range(20):  # a pool per burst, like anyio retiring idle workers
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: store.series_latest(), range(16)))
+    assert store.open_connections() <= 1 + 2 * 4
+
+
+def test_close_races_with_new_threads(tmp_path):
+    """A thread that connects while close() runs must not leave a connection
+    behind: close() and registration share the lock."""
+    for _ in range(20):
+        s = Store(tmp_path / "race.db")
+        errors: list[BaseException] = []
+
+        def use(s=s, errors=errors):
+            try:
+                s.latest("a")
+            except RuntimeError:
+                pass  # "store is closed" is the expected outcome after close()
+            except BaseException as e:  # noqa: BLE001 - surface any other error
+                errors.append(e)
+
+        threads = [threading.Thread(target=use) for _ in range(4)]
+        for t in threads:
+            t.start()
+        s.close()
+        for t in threads:
+            t.join()
+        assert errors == []
+        assert s.open_connections() == 0
+
+
+def test_close_leaves_live_threads_mid_query_alone(tmp_path):
+    """close() must not close a connection another thread is using: that
+    thread finishes its call, and its next call says the store is closed."""
+    s = Store(tmp_path / "x.db")
+    s.upsert_points([Point("a", day(2026, 1, 1), 1.0)])
+    ready, closed = threading.Event(), threading.Event()
+    results: list = []
+
+    def worker():
+        conn = s._conn()
+        ready.set()
+        closed.wait()
+        results.append(conn.execute("SELECT COUNT(*) FROM points").fetchone()[0])
+        try:
+            s.latest("a")
+        except RuntimeError as e:
+            results.append(str(e))
+
+    t = threading.Thread(target=worker)
+    t.start()
+    ready.wait()
+    s.close()
+    closed.set()
+    t.join()
+    assert results == [1, "store is closed"]
 
 
 def test_closed_store_refuses_new_connections(tmp_path):
