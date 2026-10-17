@@ -157,6 +157,9 @@ class Scheduler:
         self.flog = backfill.FailureLog(log)  # per instance: no state shared between schedulers
         self._backfill_task: asyncio.Task | None = None
         self._backfill_failed: set[str] = set()
+        # Counts runs that wrote points: each successful poll and each backfill
+        # attempt that wrote any. The API caches /api/summary until it changes.
+        self.collections = 0
 
     # --- one poll ------------------------------------------------------------------
 
@@ -202,6 +205,7 @@ class Scheduler:
                     self.store.set_backfill, c.name, BackfillState.DONE, bf.cursor, bf.progress
                 )
             await self.io(self.store.record_success, c.name)
+            self.collections += 1
         except asyncio.CancelledError:
             raise
         except Exception as e:  # one collector must not stop the others
@@ -286,6 +290,8 @@ class Scheduler:
     # --- loops ---------------------------------------------------------------------
 
     def _backfill_result(self, r: backfill.Result) -> None:
+        if r.rows:
+            self.collections += 1
         if r.error is not None:
             self._backfill_failed.add(r.collector)
 

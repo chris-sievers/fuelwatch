@@ -123,6 +123,15 @@ def _rollback(conn: sqlite3.Connection) -> None:
             log.warning("rollback failed", exc_info=True)
 
 
+class StoreClosedError(RuntimeError):
+    """A call on a closed store. A RuntimeError with the message "store is
+    closed", so callers that check for that (threads.is_store_closed) keep
+    working; the API maps it to 503."""
+
+    def __init__(self, message: str = "store is closed") -> None:
+        super().__init__(message)
+
+
 class DestructiveMigrationError(RuntimeError):
     """A migration tried to drop, delete, update or rename something."""
 
@@ -390,10 +399,10 @@ class Store:
             # each thread closes its own on its next call.
             self._local.conn = None
             conn.close()
-            raise RuntimeError("store is closed")
+            raise StoreClosedError()
         with self._lock:
             if self._closed:
-                raise RuntimeError("store is closed")
+                raise StoreClosedError()
         # isolation_level=None: no implicit transactions; we BEGIN explicitly.
         # check_same_thread=False only so a finished thread's connection can be
         # closed by the thread that reaps it; a connection is never used, or
@@ -415,7 +424,7 @@ class Store:
         with self._lock:
             if self._closed:  # close() ran while we were connecting
                 conn.close()
-                raise RuntimeError("store is closed")
+                raise StoreClosedError()
             # Reap connections whose thread has finished. Nothing else can be
             # using them: a connection is only ever used by its own thread.
             dead = [t for t in self._conns if not t.is_alive()]
