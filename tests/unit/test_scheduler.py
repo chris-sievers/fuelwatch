@@ -30,6 +30,7 @@ def small_fakes_are_plausible(monkeypatch):
     from fuelwatch import backfill
 
     monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 0)
+    monkeypatch.setattr(backfill, "REQUIRE_EVERY_SERIES", False)
 
 
 @pytest.fixture
@@ -474,6 +475,41 @@ async def test_ais_stream_writes_through_sink(store, client, monkeypatch):
     assert ais.runs == 2  # restarted after the crash
     assert store.latest(SERIES_SHIPS)[0].value == 31.0
     assert store.get_status("aisstream").error_class is None
+
+
+class SlotAis(FakeAis):
+    """Like the real stream: a sink failure is caught (and logged) by the
+    stream itself, which keeps running until its stop is set."""
+
+    def __init__(self):
+        super().__init__()
+        self.slots = 0
+
+    async def run(self, sink, stop):
+        self.runs += 1
+        while not stop.is_set():
+            self.slots += 1
+            minute = 10 * (self.slots % 6)
+            try:
+                await sink(
+                    [Point(SERIES_SHIPS, datetime(2026, 10, 17, 12, minute, tzinfo=UTC), 1.0)]
+                )
+            except Exception:
+                logging.getLogger("fake.ais").exception("AIS sink failed")
+            await asyncio.sleep(0)
+
+
+async def test_closed_store_ends_ais_quietly(tmp_path, client, caplog):
+    st = Store(tmp_path / "ais.db")
+    ais = SlotAis()
+    s = fast(st, client, [], ais=ais, run_backfill=False)
+    stop = asyncio.Event()
+    loop_task = asyncio.create_task(s._ais_loop(stop))
+    await until(lambda: ais.slots >= 2)
+    st.close()
+    await asyncio.wait_for(loop_task, timeout=2)  # ended without `stop`
+    assert not stop.is_set() and ais.runs == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
 async def test_ais_restart_delay_resets_after_a_healthy_run(store, client, monkeypatch):

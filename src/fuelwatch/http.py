@@ -39,7 +39,11 @@ class RedactingFilter(logging.Filter):
     formats the raw exception again."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = redact(record.getMessage())
+        try:
+            text = record.getMessage()
+        except Exception:  # noqa: BLE001 - a malformed log call must never raise here
+            text = f"{record.msg} (bad log arguments)"
+        record.msg = redact(str(text))
         record.args = None
         if record.exc_info:
             if not record.exc_text:

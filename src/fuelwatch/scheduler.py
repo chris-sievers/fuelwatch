@@ -113,14 +113,8 @@ def _message(e: BaseException) -> str:
     return redact(str(e)) if isinstance(e, ProviderError) else type(e).__name__
 
 
-def _log_failure(what: str, e: BaseException) -> None:
-    if is_store_closed(e):
-        log.debug("%s: store closed, stopping", what)
-    elif isinstance(e, ProviderError):
-        log.warning("%s failed: %s", what, _message(e))
-    else:
-        log.error("%s: internal error %s", what, type(e).__name__)
-        log.debug("%s traceback", what, exc_info=e)  # redacted by RedactingFilter
+def _log_failure(what: str, e: BaseException, key: str | None = None) -> None:
+    backfill.failures.report(key or what, what, e)
 
 
 class Scheduler:
@@ -216,10 +210,11 @@ class Scheduler:
                 raise  # shutting down: the loop ends quietly
             self.failures[c.name] = self.failures.get(c.name, 0) + 1
             if not isinstance(e, Stopped):
-                _log_failure(f"{c.name} poll", e)
+                _log_failure(f"{c.name} poll", e, c.name)
                 await self._record_failure(c.name, e)
             return PollResult(c.name, since, error=_message(e))
         self.failures[c.name] = 0
+        backfill.failures.recovered(c.name)
         log.info("%s: %d points since %s", c.name, n, since)
         return PollResult(c.name, since, n)
 
@@ -338,7 +333,7 @@ class Scheduler:
                     log.debug("%s: store closed, loop stopping", c.name)
                     return
                 guard_failures += 1
-                _log_failure(f"{c.name} loop", e)
+                _log_failure(f"{c.name} loop", e, c.name)
                 delay = self.retry_max  # cannot raise, unlike anything computed
                 with contextlib.suppress(Exception):
                     delay = self._backoff(max(guard_failures, self.failures.get(c.name, 0)))
@@ -348,13 +343,28 @@ class Scheduler:
         ais = self.ais
         assert ais is not None
 
+        # The stream runs until ais_stop: set by `stop`, or by the sink when
+        # the store has been closed (the stream would otherwise log a
+        # traceback for every slot it cannot write).
+        ais_stop = asyncio.Event()
+
+        async def follow_stop() -> None:
+            await stop.wait()
+            ais_stop.set()
+
         async def sink(points: list[Point]) -> None:
             try:
                 await self.io(self.store.upsert_points, points)
                 await self.io(self.store.record_success, AIS_NAME)
             except Exception as e:
+                if is_store_closed(e):
+                    log.debug("AIS: store closed, stopping the stream")
+                    ais_stop.set()
+                    return
+                _log_failure("AIS sink", e, AIS_NAME)
                 await self._record_failure(AIS_NAME, e)
                 raise
+            backfill.failures.recovered(AIS_NAME)
 
         async def mirror_status() -> None:
             # The stream reports connection errors on ais.status; copy each
@@ -369,26 +379,27 @@ class Scheduler:
                     )
                 last = cur
 
-        watcher = asyncio.create_task(mirror_status())
+        helpers = [asyncio.create_task(mirror_status()), asyncio.create_task(follow_stop())]
         delay = AIS_RESTART_START
         try:
-            while not stop.is_set():
+            while not ais_stop.is_set():
                 started = self.monotonic()
                 try:
-                    await ais.run(sink, stop)
+                    await ais.run(sink, ais_stop)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001 - keep the rest of the app alive
-                    _log_failure("AIS stream", e)
+                    _log_failure("AIS stream", e, AIS_NAME)
                     await self._record_failure(AIS_NAME, e)
                     if self.monotonic() - started >= AIS_RESTART_MAX:
                         delay = AIS_RESTART_START  # it ran healthily; start the backoff over
-                    if await backfill.wait_or_stop(stop, delay):
+                    if await backfill.wait_or_stop(ais_stop, delay):
                         break
                     delay = min(delay * 2, AIS_RESTART_MAX)
         finally:
-            watcher.cancel()
-            await asyncio.gather(watcher, return_exceptions=True)
+            for t in helpers:
+                t.cancel()
+            await asyncio.gather(*helpers, return_exceptions=True)
 
     async def run(self, stop: asyncio.Event) -> None:
         """Run until `stop` is set, then shut down: loops finish at their

@@ -25,6 +25,7 @@ FIX = Path(__file__).parent.parent / "fixtures"
 def small_fakes_are_plausible(monkeypatch):
     """The fakes return a handful of points; the threshold has its own tests."""
     monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 0)
+    monkeypatch.setattr(backfill, "REQUIRE_EVERY_SERIES", False)
 
 
 async def until(cond, timeout=5.0):
@@ -504,3 +505,84 @@ def test_cli_unknown_collector_is_an_error(tmp_path, monkeypatch, capsys):
         assert ei.value.code == 2
         err = capsys.readouterr().err
         assert "invalid choice: 'eai'" in err and "eia" in err and "portwatch" in err
+
+
+# --- second review round -----------------------------------------------------------------
+
+
+def _every_eia_series(n=60):
+    return [p for s in REGISTRY.collector("eia").series for p in daily(s.id, n)]
+
+
+async def test_partial_outage_is_a_failure(store, client, monkeypatch):
+    """EIA's spot route answers but retail, stocks and refinery come back
+    empty: enough points on average, but 19 series have none."""
+    monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 52)
+    monkeypatch.setattr(backfill, "REQUIRE_EVERY_SERIES", True)
+    spot = [
+        p
+        for s in ("brent", "wti", "nyh_gasoline", "nyh_ulsd")
+        for p in daily(f"eia.spot.{s}", 1250)
+    ]
+    assert len(spot) >= 52 * 23  # the average alone would pass
+    r = await backfill.backfill_collector(store, client, coll("eia", Fake(spot)))
+    assert r.error is not None
+    assert "no points for 19 of 23 series" in r.error and "eia.refinery.utilization" in r.error
+    assert store.get_backfill("eia").state == BackfillState.NOT_STARTED
+    assert store.get_status("eia").error_class == "implausible"
+
+    ok = await backfill.backfill_collector(store, client, coll("eia", Fake(_every_eia_series())))
+    assert ok.state == BackfillState.DONE
+
+
+async def test_failed_record_failure_still_resets_state(store, client):
+    locked = LockedStore(store, {"record_failure"})
+    r = await backfill.backfill_collector(
+        locked, client, coll("eia", Fake(error=ProviderError("http_status", "503")))
+    )
+    assert r.error == "503"
+    assert store.get_backfill("eia").state == BackfillState.NOT_STARTED
+
+
+def test_failure_log_traceback_once_per_streak(caplog):
+    import logging
+
+    fl = backfill.FailureLog(logging.getLogger("fuelwatch.test_failure_log"))
+    caplog.set_level(logging.DEBUG, logger="fuelwatch.test_failure_log")
+
+    def boom():
+        try:
+            raise TypeError("bad parser")
+        except TypeError as e:
+            return e
+
+    fl.report("eia", "eia poll", boom())
+    fl.report("eia", "eia poll", boom())
+    fl.report("eia", "eia poll", ProviderError("http_status", "503"))
+    fl.recovered("eia")
+    fl.report("eia", "eia poll", boom())
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    # exc_text once RedactingFilter (installed by the CLI tests) has formatted it
+    assert [bool(r.exc_info or r.exc_text) for r in errors] == [True, False, True]
+    assert "(repeat)" in errors[1].getMessage()
+    assert [r.levelno for r in caplog.records].count(logging.WARNING) == 1
+
+
+async def test_drain_timeout_holds_with_executor_saturated():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fuelwatch.threads import ThreadCalls
+
+    loop = asyncio.get_running_loop()
+    pool = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(pool)
+    release = threading.Event()
+    calls = ThreadCalls()
+    task = asyncio.create_task(calls(release.wait, 5))
+    await until(lambda: calls.running == 1)
+    t0 = loop.time()
+    assert await calls.drain(timeout=0.05) is False  # the only worker is busy
+    assert loop.time() - t0 < 1
+    release.set()
+    await task
+    assert await calls.drain(timeout=1) is True

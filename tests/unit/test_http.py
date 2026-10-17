@@ -71,3 +71,12 @@ def test_exception_instance_in_exc_info_is_redacted():
     logger.debug("boom", exc_info=err)
     assert "PLANTED-instance-key-77a" not in buf.getvalue()
     assert "ValueError" in buf.getvalue()
+
+
+def test_malformed_log_call_does_not_raise():
+    redact.add("PLANTED-badargs-key-31c")
+    logger, buf = _capture()
+    logger.info("bad %s %s PLANTED-badargs-key-31c", 1)  # noqa: PLE1206 - one argument short
+    out = buf.getvalue()
+    assert "bad log arguments" in out
+    assert "PLANTED-badargs-key-31c" not in out

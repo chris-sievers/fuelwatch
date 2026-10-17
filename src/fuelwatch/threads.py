@@ -1,11 +1,18 @@
-"""Worker-thread calls that shutdown can wait for.
+"""Worker-thread store calls that shutdown waits for.
 
-``asyncio.to_thread`` keeps running its function after the awaiting task is
-cancelled. If the app closes the Store right after the scheduler stops, a
-write still in a worker could find its connection closed. ``ThreadCalls``
-counts calls that have started in a worker, so shutdown can ``drain()``
-them (bounded) before the store closes. A call still queued when its task
-is cancelled never starts, so it is never waited for.
+An ordering guarantee, not crash prevention: ``asyncio.to_thread`` keeps
+running a function after its awaiting task is cancelled, so without this a
+store write could still be in flight when ``Scheduler.run`` returns.
+``ThreadCalls`` counts calls running in a worker, and ``drain()`` waits
+(bounded) until they finish, so writes complete before the caller closes
+the store. (Since #13, ``Store.close()`` lets in-flight calls finish and
+later ones raise "store is closed", which the scheduler handles quietly.)
+
+Limits: a call counts from the moment its worker starts it, so one queued
+behind busy workers when the task is cancelled is not waited for (it then
+meets a closed store and stops cleanly). ``drain()`` polls from the event
+loop rather than using a worker of its own, so its timeout holds even when
+every executor worker is busy.
 """
 
 from __future__ import annotations
@@ -37,15 +44,15 @@ class ThreadCalls:
 
         return await asyncio.to_thread(call)
 
-    def _wait_idle(self, timeout: float) -> bool:
-        with self._cond:
-            return self._cond.wait_for(lambda: self._running == 0, timeout=timeout)
-
-    async def drain(self, timeout: float = 10.0) -> bool:
+    async def drain(self, timeout: float = 10.0, poll: float = 0.01) -> bool:
         """Wait until no call is running in a worker; False on timeout."""
-        if self.running == 0:
-            return True
-        return await asyncio.to_thread(self._wait_idle, timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self.running:
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(poll)
+        return True
 
 
 def is_store_closed(e: BaseException) -> bool:

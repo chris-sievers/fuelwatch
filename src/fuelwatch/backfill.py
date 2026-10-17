@@ -20,8 +20,9 @@ state never sits at "running" while nothing runs; ``run`` retries it later
 with a doubling delay. The scheduler starts polling a collector whose
 backfill has failed, so recent data keeps arriving while history waits.
 
-A full fetch that returns fewer than MIN_POINTS_PER_SERIES points per
-registered series on average is treated as a failure, not done. Five years
+A full fetch that leaves any registered series without a point, or returns
+fewer than MIN_POINTS_PER_SERIES points per series on average, is treated
+as a failure, not done. Five years
 of the sparsest series (weekly) is about 260 points per series, so less
 than one year's worth means an outage or a truncated answer, and marking it
 done would leave the history missing for good (polls only fetch recent
@@ -60,6 +61,7 @@ CHUNK = 2000  # points per upsert transaction
 RETRY_START = 60.0  # seconds before retrying a failed collector, doubling
 RETRY_MAX = 6 * 3600.0
 MIN_POINTS_PER_SERIES = 52  # one year of weekly data; see the module docstring
+REQUIRE_EVERY_SERIES = True  # a full fetch must cover every registered series
 
 # Minimum seconds between requests to one host.
 PACING = {
@@ -97,11 +99,27 @@ def _sorted(points: list[Point]) -> list[Point]:
 
 
 def check_plausible(collector: Collector, points: list[Point], since: date | None) -> None:
-    """Raise ProviderError unless the fetch looks like real history."""
+    """Raise ProviderError unless the fetch looks like real history.
+
+    A full fetch must have at least one point for every registered series
+    (an outage that empties one EIA route still leaves the others' points,
+    which alone would pass the average) and at least MIN_POINTS_PER_SERIES
+    per series on average."""
     if since is not None:
         if not points:
             raise ProviderError("empty", f"{collector.name}: no points since {since}")
         return
+    if REQUIRE_EVERY_SERIES:
+        missing = sorted({s.id for s in collector.series} - {p.series for p in points})
+        if missing:
+            shown = ", ".join(missing[:5]) + (
+                f" and {len(missing) - 5} more" if len(missing) > 5 else ""
+            )
+            raise ProviderError(
+                "implausible",
+                f"{collector.name}: backfill returned no points for "
+                f"{len(missing)} of {len(collector.series)} series: {shown}",
+            )
     need = MIN_POINTS_PER_SERIES * len(collector.series)
     if len(points) < need:
         raise ProviderError(
@@ -109,6 +127,34 @@ def check_plausible(collector: Collector, points: list[Point], since: date | Non
             f"{collector.name}: backfill returned {len(points)} points for "
             f"{len(collector.series)} series, expected at least {need}",
         )
+
+
+class FailureLog:
+    """Logs failures without flooding: a provider error is a warning with
+    its sanitized message; an internal error logs its (redacted) traceback
+    at ERROR the first time in a row for a key, then the type only, until
+    ``recovered(key)``."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        self._log = logger
+        self._seen: set[str] = set()
+
+    def report(self, key: str, what: str, e: BaseException) -> None:
+        if is_store_closed(e):
+            self._log.debug("%s: store closed, stopping", what)
+        elif isinstance(e, ProviderError):
+            self._log.warning("%s failed: %s", what, _message(e))
+        elif key in self._seen:
+            self._log.error("%s: internal error %s (repeat)", what, type(e).__name__)
+        else:
+            self._seen.add(key)
+            self._log.error("%s: internal error %s", what, type(e).__name__, exc_info=e)
+
+    def recovered(self, key: str) -> None:
+        self._seen.discard(key)
+
+
+failures = FailureLog(log)
 
 
 async def unless_stopped(aw, stop: asyncio.Event | None):
@@ -185,31 +231,33 @@ async def backfill_collector(
         raise
     except Stopped:
         return Result(name, BackfillState.RUNNING, written)  # resumes on the next start
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - logged by failures.report, recorded, returned
         if is_store_closed(e):
             log.debug("backfill %s: store closed, stopping", name)
             return Result(name, BackfillState.RUNNING, written)
         msg = _message(e)
-        if isinstance(e, ProviderError):
-            log.warning("backfill %s failed: %s", name, msg)
-        else:
-            log.error("backfill %s: internal error %s", name, msg)
-            log.debug("backfill %s traceback", name, exc_info=True)
+        failures.report(f"backfill:{name}", f"backfill {name}", e)
         await _record_failed(store, io, name, e, cursor, progress)
         return Result(name, BackfillState.NOT_STARTED, written, error=redact(msg))
+    failures.recovered(f"backfill:{name}")
     log.info("backfill %s: done, %d points", name, written)
     return Result(name, BackfillState.DONE, written)
 
 
 async def _record_failed(store, io, name, error, cursor, progress) -> None:
-    """Best effort: the store may be what failed."""
-    try:
-        await io(store.record_failure, name, error)
-        await io(store.set_backfill, name, BackfillState.NOT_STARTED, cursor, progress)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:  # noqa: BLE001 - logged; the retry loop carries on
-        log.error("backfill %s: could not record the failure: %s", name, type(e).__name__)
+    """Best effort: the store may be what failed. The state goes first, so
+    a failing record_failure cannot leave it at "running"."""
+    for what, fn, args in (
+        ("state", store.set_backfill, (name, BackfillState.NOT_STARTED, cursor, progress)),
+        ("failure", store.record_failure, (name, error)),
+    ):
+        try:
+            await io(fn, *args)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - logged; the retry loop carries on
+            if not is_store_closed(e):
+                log.error("backfill %s: could not record the %s: %s", name, what, type(e).__name__)
 
 
 async def wait_or_stop(stop: asyncio.Event | None, seconds: float) -> bool:
