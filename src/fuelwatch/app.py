@@ -17,13 +17,17 @@ Routes (all GET)
                          ranges over 7 days
     /api/events          event markers from src/fuelwatch/events.json
     /api/status          one row per source; backfill from backfill.summary()
+    /api/dashboard       everything the page draws, for one time range
+                         (?range=war|1y|5y); see fuelwatch.api.dashboard
     /api/version         FW_COMMIT and FW_BUILD_TIME
     /healthz             "ok"
-    /, /about            placeholders until the dashboard (milestone 3)
+    /, /about            the dashboard and the About page (static HTML)
+    /static/...          the page's script, styles and vendored Chart.js
 
 Caching (in process)
-    /api/series, /api/data and /api/status: 60 s. /api/summary: until the scheduler's
-    collection count changes, and at most an hour. /api/events: loaded once.
+    /api/series, /api/data, /api/dashboard and /api/status: 60 s. /api/summary:
+    until the scheduler's collection count changes, and at most an hour.
+    /api/events: loaded once.
 
 Every response, errors included, carries the spec's Content-Security-Policy,
 X-Content-Type-Options and Referrer-Policy (an ASGI wrapper outside
@@ -31,8 +35,11 @@ Starlette's error middleware, so even a 500 has them). A closed store is a
 503. Error bodies never include exception text.
 
 Settings (environment)
-    FW_API_SPOT_DATA   0 (default) or 1: serve the four EIA spot series
-                       (Refinitiv data) through /api/data
+    FW_API_SPOT_DATA   1 (default) or 0: whether /api/data serves the four
+                       EIA spot series (Refinitiv data). The dashboard charts
+                       them either way (terms-review.md, Decision 2026-10-17)
+    FW_DEMO            0 (default) or 1: demo mode, synthetic data and no
+                       collectors (see fuelwatch.demo); FW_DEMO_NOW fixes its clock
     FW_METRICS_HOST    default 127.0.0.1
     FW_METRICS_PORT    default 9201
     FW_COMMIT, FW_BUILD_TIME   shown by /api/version, default "unknown"
@@ -52,9 +59,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException
 
+from fuelwatch import demo as demo_mod
+from fuelwatch.api import dashboard as dashboard_mod
 from fuelwatch.api import events as events_mod
 from fuelwatch.api import metrics as metrics_mod
 from fuelwatch.api import views
@@ -148,20 +159,10 @@ class _App(FastAPI):
         return SecurityHeaders(super().build_middleware_stack())
 
 
-# --- placeholders -----------------------------------------------------------------
+# --- pages --------------------------------------------------------------------------
 
-_PAGE = """<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title></head>
-<body>
-<h1>{title}</h1>
-<p>{text}</p>
-<p>The JSON API is live: <a href="/api/summary">summary</a>, <a href="/api/series">series</a>,
-<a href="/api/status">status</a>.</p>
-</body>
-</html>
-"""
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+_PAGE_HEADERS = {"cache-control": "no-cache"}
 
 
 # --- the app ----------------------------------------------------------------------
@@ -174,25 +175,40 @@ def create_app(
     registry: Registry = REGISTRY,
     clock: Callable[[], datetime] = _utcnow,
     spot_data: bool | None = None,
+    demo: bool | None = None,
     metrics_host: str | None = None,
     metrics_port: int | None | _Auto = AUTO,
     events_path: Path = events_mod.PATH,
 ) -> FastAPI:
     """Build the app. Defaults come from the environment; tests pass
     ``scheduler_factory=None`` and ``metrics_port=None`` to run without the
-    collectors or the metrics server."""
+    collectors or the metrics server.
+
+    Demo mode (``demo=True``, or FW_DEMO=1) replaces the store with a seeded
+    throwaway one, the scheduler with one that runs no collector, and the
+    event markers with the demo's own; FW_DEMO_NOW fixes the clock."""
+    if demo is None:
+        demo = demo_mod.enabled()
+    event_list = events_mod.load(events_path)  # a bad file stops the app here
+    if demo:
+        fixed = demo_mod.parse_now(os.environ.get(demo_mod.ENV_NOW))
+        if fixed is not None:
+            clock = lambda: fixed
+        demo_clock = clock
+        store_factory = lambda: demo_mod.DemoStore(demo_clock())
+        scheduler_factory = lambda store: demo_mod.DemoScheduler(store, demo_clock())
+        event_list = events_mod.parse(list(demo_mod.EVENTS))
     if isinstance(scheduler_factory, _Auto):
         from fuelwatch.scheduler import Scheduler
 
         scheduler_factory = Scheduler
     if spot_data is None:
-        spot_data = env_flag("FW_API_SPOT_DATA")
+        spot_data = env_flag("FW_API_SPOT_DATA", default=True)
     if isinstance(metrics_port, _Auto):
         metrics_port = env_port("FW_METRICS_PORT", DEFAULT_METRICS_PORT)
     if metrics_host is None:
         metrics_host = os.environ.get("FW_METRICS_HOST", "").strip() or DEFAULT_METRICS_HOST
     version = {"commit": _version_value("FW_COMMIT"), "build_time": _version_value("FW_BUILD_TIME")}
-    event_list = events_mod.load(events_path)  # a bad file stops the app here
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -231,8 +247,11 @@ def create_app(
         redoc_url=None,
         openapi_url=None,
     )
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     app.state.store = None
     app.state.scheduler = None
+    app.state.demo = demo
     app.state.cache = Cache(lambda: clock().timestamp())
     app.state.metrics_registry = metrics_mod.make_registry(
         metrics_mod.AppMetrics(
@@ -286,16 +305,33 @@ def create_app(
     async def healthz():
         return "ok"
 
-    @app.get("/", response_class=HTMLResponse)
+    @app.get("/")
     async def index():
-        return _PAGE.format(title="Fuelwatch", text="The dashboard arrives in milestone 3.")
+        return FileResponse(STATIC_DIR / "index.html", headers=_PAGE_HEADERS)
 
-    @app.get("/about", response_class=HTMLResponse)
+    @app.get("/about")
     async def about():
-        return _PAGE.format(
-            title="About Fuelwatch",
-            text="The glossary and source notes arrive with the dashboard in milestone 3.",
-        )
+        return FileResponse(STATIC_DIR / "about.html", headers=_PAGE_HEADERS)
+
+    @app.get("/api/dashboard")
+    async def api_dashboard(range: str = Query(dashboard_mod.DEFAULT_RANGE, max_length=8)):
+        if range not in dashboard_mod.RANGES:
+            raise HTTPException(400, f"range must be one of {', '.join(dashboard_mod.RANGES)}")
+        key = ("dashboard", range)
+        hit = cache.get(key, SERIES_TTL)
+        if hit is None:
+            hit = await asyncio.to_thread(
+                dashboard_mod.build,
+                store_of(),
+                registry,
+                clock(),
+                range_key=range,
+                events=views.events(event_list)["events"],
+                ais=ais(),
+                demo=demo,
+            )
+            cache.put(key, hit)
+        return hit
 
     @app.get("/api/version")
     async def api_version():

@@ -28,8 +28,9 @@ from fuelwatch.store import CollectorStatus, Store
 AIS_COLLECTOR = "aisstream"
 MAX_MESSAGE = 300
 ROLLUP_AFTER_DAYS = 7  # AIS ranges covering more days than this come back as daily roll-ups
-# The four EIA spot series are Refinitiv (LSEG) data republished by EIA; they
-# stay out of /api/data unless FW_API_SPOT_DATA=1 (see terms-review.md).
+# The four EIA spot series are Refinitiv (LSEG) data republished by EIA. The
+# dashboard charts them; /api/data serves them unless FW_API_SPOT_DATA=0
+# (terms-review.md, Decision 2026-10-17).
 SPOT_SERIES = frozenset({calc.BRENT, calc.WTI, "eia.spot.nyh_gasoline", "eia.spot.nyh_ulsd"})
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")

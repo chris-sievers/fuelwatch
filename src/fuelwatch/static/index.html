@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="Crude prices, US pump prices, stored oil and Strait of Hormuz shipping on one page, with every number dated.">
+<title>Fuelwatch</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/vendor/chart.js-4.5.1/chart.umd.min.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to the numbers</a>
+<p id="demo-banner" class="banner" hidden><strong>Demo data.</strong> Every number on this page is made up, to show how Fuelwatch works. None of it is a real price or ship count.</p>
+<header class="site">
+  <h1>Fuelwatch</h1>
+  <p class="tagline">What the Iran war is doing to fuel prices, on one page. Every number says how old it is.</p>
+</header>
+<main id="main">
+  <section id="headline" class="panel" aria-labelledby="h-headline">
+    <h2 id="h-headline" class="visually-hidden">Where things stand</h2>
+    <p id="summary" class="summary" aria-live="polite">Loading the latest numbers.</p>
+    <p id="summary-asof" class="asof"></p>
+    <div id="tiles" class="tiles"></div>
+  </section>
+
+  <nav class="range" aria-label="Time range for the charts">
+    <span class="range-label">Show charts for:</span>
+    <button type="button" data-range="war" aria-pressed="false">Since the war began</button>
+    <button type="button" data-range="1y" aria-pressed="true">1 year</button>
+    <button type="button" data-range="5y" aria-pressed="false">5 years</button>
+    <span id="range-note" class="range-note"></span>
+  </nav>
+
+  <section id="crude" class="panel" aria-labelledby="h-crude">
+    <h2 id="h-crude">Crude oil</h2>
+    <p class="question">What is crude doing?</p>
+    <div id="crude-body" class="figures"></div>
+  </section>
+
+  <section id="pump" class="panel" aria-labelledby="h-pump">
+    <h2 id="h-pump">At the pump</h2>
+    <p class="question">What are drivers paying?</p>
+    <div id="pump-body" class="figures"></div>
+  </section>
+
+  <section id="hormuz" class="panel" aria-labelledby="h-hormuz">
+    <h2 id="h-hormuz">Hormuz</h2>
+    <p class="question">Is oil still moving through the Strait of Hormuz?</p>
+    <div id="hormuz-body" class="figures"></div>
+  </section>
+
+  <section id="stocks" class="panel" aria-labelledby="h-stocks">
+    <h2 id="h-stocks">Stored oil</h2>
+    <p class="question">How much cushion does the US have?</p>
+    <div id="stocks-body" class="figures"></div>
+  </section>
+</main>
+<footer id="footer" class="panel site-footer" aria-labelledby="h-footer">
+  <h2 id="h-footer">Is everything working?</h2>
+  <div class="table-wrap">
+    <table id="sources" class="cards">
+      <thead><tr><th scope="col">Source</th><th scope="col">Data through</th><th scope="col">Published</th><th scope="col">Last checked</th><th scope="col">Status</th></tr></thead>
+      <tbody id="sources-body"></tbody>
+    </table>
+  </div>
+  <p class="links"><a href="/about">About Fuelwatch: what the words mean, and where the numbers come from</a> · <a href="/about#api">The JSON API</a></p>
+  <p class="note">No forecasts, trading signals or investment advice.</p>
+</footer>
+<noscript><p class="panel">This page needs JavaScript to draw its numbers and charts. The <a href="/about">About page</a> works without it.</p></noscript>
+</body>
+</html>

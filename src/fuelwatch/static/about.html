@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>About Fuelwatch</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="site">
+  <h1>About Fuelwatch</h1>
+  <p class="tagline"><a href="/">Back to the dashboard</a></p>
+</header>
+<main id="main" class="prose">
+<section class="panel">
+  <h2>What this is</h2>
+  <p>Fuelwatch puts crude oil prices, US pump prices, stored oil and shipping through the Strait of Hormuz on one page. It collects free public data, keeps the history, and shows every number with its source and how old it is. It gives no forecasts, trading signals or investment advice.</p>
+  <p>Most of the data is daily but published once a week, so many numbers are several days old even when nothing is wrong. A source is marked <strong>Late</strong> only when a scheduled publication has not arrived within its grace period.</p>
+</section>
+
+<section class="panel" id="glossary">
+  <h2>What the words mean</h2>
+  <p>The dashboard uses everyday words. These are the terms the sources use, and what the dashboard calls them.</p>
+  <dl>
+    <dt>Brent</dt>
+    <dd>The main world price for crude oil. The series is EIA's Brent spot price, a "Dated Brent" assessment made by Refinitiv (LSEG): the price for physical cargoes of North Sea crude, not a futures price.</dd>
+    <dt>WTI (West Texas Intermediate)</dt>
+    <dd>The main US crude price, for oil delivered at Cushing, Oklahoma. "The gap" on the dashboard is Brent minus WTI.</dd>
+    <dt>Spot price</dt>
+    <dd>The price for oil or fuel bought for delivery now. In a supply shock it can sit far from futures prices.</dd>
+    <dt>What stations pay (New York Harbor spot prices)</dt>
+    <dd>Wholesale prices for conventional regular gasoline and ultra-low sulfur diesel (ULSD) at New York Harbor, in dollars a gallon. One hub; it leads pump prices by one to two weeks. RBOB, the gasoline blend traded on futures markets, is not shown.</dd>
+    <dt>Regions (PADD)</dt>
+    <dd>EIA reports pump prices for the five Petroleum Administration for Defense Districts: East Coast (PADD 1), Midwest (PADD 2), Gulf Coast (PADD 3), Rocky Mountain (PADD 4) and West Coast (PADD 5), plus California on its own.</dd>
+    <dt>Diesel</dt>
+    <dd>At the pump: EIA's on-highway diesel price. In stored oil, "diesel and heating oil" is EIA's distillate fuel oil.</dd>
+    <dt>Stored oil (WPSR)</dt>
+    <dd>US stocks from EIA's Weekly Petroleum Status Report, for the week ending the Friday before. "Crude oil" is commercial crude and does not count the emergency reserve.</dd>
+    <dt>Emergency reserve (SPR)</dt>
+    <dd>The Strategic Petroleum Reserve: crude oil the US government holds for emergencies.</dd>
+    <dt>Refineries in use (refinery utilization)</dt>
+    <dd>How much crude US refineries are processing, as a percent of their operable capacity. Near 95% means they are running flat out.</dd>
+    <dt>Million barrels; bbl</dt>
+    <dd>A barrel (bbl) of oil is 42 US gallons.</dd>
+    <dt>Ships crossing (transit calls)</dt>
+    <dd>IMF PortWatch's daily count of ships passing through a sea route, estimated from AIS signals. "Tankers" are the tanker part of that count. PortWatch also estimates tanker cargo in tonnes; it is an estimate, not ship size (deadweight, DWT).</dd>
+    <dt>Sea routes (chokepoints)</dt>
+    <dd>Narrow passages most shipping must use: the Strait of Hormuz, Bab el-Mandeb at the mouth of the Red Sea, the Suez Canal, the Cape of Good Hope and the Strait of Malacca.</dd>
+    <dt>The newest days may still change (provisional)</dt>
+    <dd>PortWatch revises recent days, sometimes by a third or more and weeks back. The two newest days of each release are treated as provisional: shown hatched, and left out of every "vs normal" number.</dd>
+    <dt>Normal (baseline)</dt>
+    <dd>For ships crossing: the average over the 90 days up to and including the reference date. "Percent of normal" is the 7-day average of the newest settled days as a percent of that.</dd>
+    <dt>Since the war began (reference date)</dt>
+    <dd>Changes are measured from the last reading on or before the reference date, Feb 27, 2026 by default: the last full day before the military action EIA dates to Feb 28. The operator of each copy can change it; the dashboard shows the date it uses.</dd>
+    <dt>Typical range</dt>
+    <dd>The lowest and highest value for the same week of the year over the previous five years (ISO weeks; week 53 counts as week 52). It shows whether storage is low, normal or high for the season.</dd>
+    <dt>Ships broadcasting their position (AIS)</dt>
+    <dd>The Automatic Identification System: radio messages ships send with their identity and position. The live count is distinct large ships (Class A transponders, identified by MMSI) heard in the strait in each 10-minute slot, received through AISStream. Jamming, spoofing and ships that switch AIS off make it an indicator only; small craft (Class B) are not counted.</dd>
+    <dt>Crude's share of the pump price</dt>
+    <dd>Brent from two weeks earlier, divided by 42 gallons, as a percent of this week's US gasoline price. A rough estimate that matches the usual lag from crude to the pump.</dd>
+    <dt>Cost to fill a tank</dt>
+    <dd>The US gasoline price times 15 gallons (the operator can change the tank size).</dd>
+  </dl>
+</section>
+
+<section class="panel" id="sources">
+  <h2>Where the numbers come from</h2>
+  <ul>
+    <li><strong>U.S. Energy Information Administration (EIA)</strong>, API v2. Spot prices (Brent, WTI, New York Harbor gasoline and diesel): daily prices released weekly, usually Wednesday. Pump prices: weekly, Monday's survey released Monday evening, later after a federal holiday. Stored oil and refineries: weekly, Wednesday, for the week ending the Friday before.</li>
+    <li><strong>IMF PortWatch</strong>, daily chokepoint data, published weekly, usually Tuesday, with data through the Sunday before. Every collection re-reads the last 35 days so revisions land.</li>
+    <li><strong>European Commission, Weekly Oil Bulletin</strong>: pump prices with taxes for the EU average, Germany, France, Italy and Spain. Weekly, Thursday, with prices as of the Monday before. Published in € per 1,000 litres; Fuelwatch converts to € per litre. Not comparable with US prices, and comparisons between countries are of limited validity.</li>
+    <li><strong>AISStream</strong>: live AIS messages, counted by Fuelwatch every 10 minutes while connected. Off on copies without a key.</li>
+  </ul>
+  <p>Calculated figures are Fuelwatch's, not the sources': changes since the last reading and since the war began, percent of normal and 7-day averages, the Brent–WTI gap, the cost to fill a tank, crude's share of the pump price, and typical ranges.</p>
+</section>
+
+<section class="panel" id="credits">
+  <h2>Credits and terms</h2>
+  <p>Each chart carries its source line. In full:</p>
+  <blockquote class="attribution">Source: U.S. Energy Information Administration (EIA). Spot prices: EIA, from Refinitiv, an LSEG business. Calculated figures are Fuelwatch's, based on EIA data. Fuelwatch is not affiliated with or endorsed by EIA.</blockquote>
+  <blockquote class="attribution">Sources: Kpler; UN Global Platform; IMF PortWatch (portwatch.imf.org). 7-day averages and "vs normal" are Fuelwatch calculations. Used under the IMF terms: https://www.imf.org/en/About/copyright-and-terms. Fuelwatch is not affiliated with or endorsed by the IMF.</blockquote>
+  <blockquote class="attribution">Source: European Commission, Weekly Oil Bulletin, under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). Values converted by Fuelwatch from € per 1,000 L to € per litre.</blockquote>
+  <blockquote class="attribution">Live AIS counts: Fuelwatch, from AIS messages received through AISStream (aisstream.io).</blockquote>
+  <p>On the dashboard, the EIA line names the release date of the newest data shown. Terms: <a href="https://www.eia.gov/about/copyrights_reuse.php">EIA copyrights and reuse</a>, <a href="https://www.imf.org/en/About/copyright-and-terms">IMF copyright and usage</a>, <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>. Charts are drawn with Chart.js (MIT licence), served from this site.</p>
+</section>
+
+<section class="panel" id="api">
+  <h2>The JSON API</h2>
+  <p>Everything is read-only and needs no key. Responses carry the source line for each series.</p>
+  <ul>
+    <li><a href="/api/summary"><code>/api/summary</code></a>: the summary sentence, the six headline numbers and the calculated figures.</li>
+    <li><a href="/api/series"><code>/api/series</code></a>: every series with its latest and previous value, freshness and source.</li>
+    <li><a href="/api/status"><code>/api/status</code></a>: how each source is doing.</li>
+    <li><a href="/api/events"><code>/api/events</code></a>: the event markers on the crude chart.</li>
+    <li><code>/api/data/{series}?start=YYYY-MM-DD&amp;end=YYYY-MM-DD</code>: history for one series, at most five years per request. Available for US pump prices by region (<code>eia.retail.gasoline.us</code>, <code>eia.retail.diesel.ca</code> and so on), US stored oil and refinery use (<code>eia.stocks.*</code>, <code>eia.refinery.utilization</code>), ships crossing each sea route (<code>portwatch.*</code>), EU pump prices (<code>eu_pump_*</code>) and live AIS counts (<code>hormuz_ais_*</code>, as daily figures for ranges over a week).</li>
+  </ul>
+  <p>PortWatch data is used under the IMF terms linked above; if you reuse it, the same terms apply to you.</p>
+</section>
+</main>
+</body>
+</html>
