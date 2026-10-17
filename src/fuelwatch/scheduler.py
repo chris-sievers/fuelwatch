@@ -63,7 +63,7 @@ from fuelwatch.http import PacedClient, ProviderError, Stopped, make_client, red
 from fuelwatch.models import Point
 from fuelwatch.registry import REGISTRY, Collector, Registry, next_release, pending_release
 from fuelwatch.store import BackfillState, Store
-from fuelwatch.threads import ThreadCalls
+from fuelwatch.threads import ThreadCalls, is_store_closed
 
 log = logging.getLogger(__name__)
 
@@ -114,7 +114,9 @@ def _message(e: BaseException) -> str:
 
 
 def _log_failure(what: str, e: BaseException) -> None:
-    if isinstance(e, ProviderError):
+    if is_store_closed(e):
+        log.debug("%s: store closed, stopping", what)
+    elif isinstance(e, ProviderError):
         log.warning("%s failed: %s", what, _message(e))
     else:
         log.error("%s: internal error %s", what, type(e).__name__)
@@ -185,7 +187,8 @@ class Scheduler:
 
     async def poll(self, c: Collector) -> PollResult:
         """Run one incremental fetch and write it. Records the outcome in
-        status when the store allows; never raises except on cancellation."""
+        status when the store allows; never raises except on cancellation
+        or a closed store."""
         since: date | None = None
         try:
             since = self.since_for(c, await self._latest(c))
@@ -208,7 +211,9 @@ class Scheduler:
             await self.io(self.store.record_success, c.name)
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001 - one collector must not stop the others
+        except Exception as e:  # one collector must not stop the others
+            if is_store_closed(e):
+                raise  # shutting down: the loop ends quietly
             self.failures[c.name] = self.failures.get(c.name, 0) + 1
             if not isinstance(e, Stopped):
                 _log_failure(f"{c.name} poll", e)
@@ -220,11 +225,15 @@ class Scheduler:
 
     async def _record_failure(self, name: str, e: BaseException) -> None:
         """Best effort: the store may be what failed."""
+        if is_store_closed(e):
+            return
         try:
             await self.io(self.store.record_failure, name, e)
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001 - logged; the caller backs off
+            if is_store_closed(err):
+                return
             log.error("%s: could not record the failure: %s", name, type(err).__name__)
 
     async def poll_all(self) -> list[PollResult]:
@@ -325,6 +334,9 @@ class Scheduler:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - a loop must never die
+                if is_store_closed(e):
+                    log.debug("%s: store closed, loop stopping", c.name)
+                    return
                 guard_failures += 1
                 _log_failure(f"{c.name} loop", e)
                 delay = self.retry_max  # cannot raise, unlike anything computed

@@ -46,3 +46,10 @@ class ThreadCalls:
         if self.running == 0:
             return True
         return await asyncio.to_thread(self._wait_idle, timeout)
+
+
+def is_store_closed(e: BaseException) -> bool:
+    """The Store raises RuntimeError("store is closed") for a call after
+    close(). During shutdown that is expected: stop quietly. (Issue #15 may
+    replace this with a StoreClosedError subclass.)"""
+    return isinstance(e, RuntimeError) and str(e) == "store is closed"

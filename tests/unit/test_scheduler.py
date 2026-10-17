@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sqlite3
 import threading
 from datetime import UTC, date, datetime, timedelta
@@ -422,6 +423,21 @@ async def test_shutdown_waits_for_writes_in_flight(store, client):
     await asyncio.wait_for(task, timeout=sch.SHUTDOWN_GRACE + 5)
     assert finished == [1]
     assert s.io.running == 0
+
+
+async def test_store_closed_stops_quietly(tmp_path, client, caplog):
+    st = Store(tmp_path / "closing.db")
+    f = Fake([brent(day(2026, 10, 13))])
+    s = fast(st, client, [like("eia", f)], run_backfill=False)
+    stop = asyncio.Event()
+    task = asyncio.create_task(s.run(stop))
+    await until(lambda: len(f.calls) >= 1)
+    st.close()  # the app closed the store first
+    await until(lambda: all(t.done() for t in asyncio.all_tasks() if t.get_name() == "poll:eia"))
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert "Traceback" not in caplog.text
 
 
 def test_empty_selection_means_none(store):

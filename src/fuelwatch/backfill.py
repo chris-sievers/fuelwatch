@@ -51,7 +51,7 @@ from fuelwatch.http import PacedClient, ProviderError, Stopped, make_client, red
 from fuelwatch.models import Point
 from fuelwatch.registry import REGISTRY, Collector
 from fuelwatch.store import BackfillState, Store
-from fuelwatch.threads import ThreadCalls
+from fuelwatch.threads import ThreadCalls, is_store_closed
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +186,9 @@ async def backfill_collector(
     except Stopped:
         return Result(name, BackfillState.RUNNING, written)  # resumes on the next start
     except Exception as e:
+        if is_store_closed(e):
+            log.debug("backfill %s: store closed, stopping", name)
+            return Result(name, BackfillState.RUNNING, written)
         msg = _message(e)
         if isinstance(e, ProviderError):
             log.warning("backfill %s failed: %s", name, msg)
