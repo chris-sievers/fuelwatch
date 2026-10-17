@@ -13,6 +13,9 @@ dependencies = [
   "websockets>=12",
 ]
 
+[project.scripts]
+fuelwatch = "fuelwatch.__main__:main"
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
