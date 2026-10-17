@@ -2,17 +2,24 @@ name: ci
 
 # Runs on every pull request and every push to main. Never uses
 # pull_request_target and never reads a secret, so a forked pull request
-# gets nothing it could leak.
+# gets nothing it could leak. The weekly scheduled run on main is the one
+# where gitleaks scans the whole history (pull request and push runs scan
+# only their own commits), and it lets pip-audit catch newly published
+# advisories while main is unchanged.
 on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: "0 5 * * 1" # Mondays 05:00 UTC
 
 permissions:
   contents: read
 
+# One group per PR, or per event and ref otherwise, so a scheduled run and a
+# push to main never cancel each other.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.event.pull_request.number || format('{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: true
 
 jobs:
