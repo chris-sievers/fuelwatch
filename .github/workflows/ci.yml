@@ -1,0 +1,79 @@
+name: ci
+
+# Runs on every pull request and every push to main. Never uses
+# pull_request_target and never reads a secret, so a forked pull request
+# gets nothing it could leak.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip setuptools
+          .venv/bin/python -m pip install -e '.[dev]' pip-audit
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format
+        run: ruff format --check .
+
+      - name: Unit tests
+        # Tests marked contract skip themselves unless FW_CONTRACT=1.
+        run: pytest
+
+      - name: Audit installed dependencies
+        # The project itself is installed editable and is not on PyPI.
+        run: pip-audit --skip-editable
+
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          # Used only for read-only API calls; no license is needed on a
+          # personal account. PR comments are off so the token stays read-only.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: Download actionlint
+        id: get_actionlint
+        # Download script pinned to the v1.7.12 commit, binary version pinned too.
+        run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/914e7df21a07ef503a81201c76d2b11c789d3fca/scripts/download-actionlint.bash) 1.7.12
+        shell: bash
+
+      - name: Lint workflows
+        run: ${{ steps.get_actionlint.outputs.executable }} -color
+        shell: bash
+
+      # Still to come from the spec's ci row: the Trivy scan and the unpushed
+      # test build arrive with the Dockerfile, and the UI screenshots with the
+      # dashboard.
