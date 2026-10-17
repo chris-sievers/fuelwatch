@@ -18,7 +18,8 @@ jobs:
   contract:
     name: contract
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # The AIS session can take up to 7 minutes, and transient failures rerun.
+    timeout-minutes: 30
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,7 +44,19 @@ jobs:
           FW_CONTRACT: "1"
           EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
-        run: .venv/bin/pytest tests/contract
+        # Failed tests rerun up to twice, a minute apart, but only on transient
+        # errors: an EIA 5xx or transport error, or an AIS timeout, dropped
+        # connection or 5xx handshake. Assertion failures, 4xx responses and
+        # bad JSON never rerun, so a real format change still fails the run.
+        run: >-
+          .venv/bin/pytest tests/contract
+          --reruns 2 --reruns-delay 60
+          --only-rerun '^ProviderError: 5[0-9][0-9] from '
+          --only-rerun '^ProviderError: [A-Za-z]+ calling '
+          --only-rerun '^TimeoutError\b'
+          --only-rerun '^ConnectionClosedError\b'
+          --only-rerun '^ConnectionResetError\b'
+          --only-rerun '^InvalidStatus: .*HTTP 5[0-9][0-9]'
 
   report-failure:
     name: report-failure
