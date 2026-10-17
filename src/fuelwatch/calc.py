@@ -18,7 +18,9 @@ Time model (see the spec's Data rules)
     Friday for EIA stocks, the day for PortWatch. "The value on a date" is the
     last observation on or before it (``Store.value_on``), which lines daily
     and weekly series up on the reference date even when it is a weekend, a
-    holiday or falls between two weekly period dates.
+    holiday or falls between two weekly period dates. Reference-date lookups
+    are capped at ``now``; when ``now`` is before the reference date, every
+    number that needs the reference date is not available, with a reason.
 
 PortWatch
     The two newest days of each publication are stored provisional and are
@@ -57,12 +59,6 @@ REGION_NAMES = {
     "padd5": "West Coast",
     "ca": "California",
 }
-WEEKLY_STOCKS = (
-    "eia.stocks.crude_commercial",
-    "eia.stocks.gasoline",
-    "eia.stocks.distillate",
-    "eia.stocks.spr",
-)
 
 
 def gasoline(region: str = "us") -> str:
@@ -158,6 +154,7 @@ class TankCost(Result):
     then_as_of: date | None = None
     change: float | None = None
     percent: float | None = None
+    then_reason: str | None = None  # why ``then`` (and so the change) is missing
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -271,6 +268,34 @@ def _no_data(series: str) -> str:
     return f"no data yet for {series}"
 
 
+def _future_ref(settings: Settings, now: datetime) -> str | None:
+    """A reason when the reference date is after ``now``: nothing from the
+    reference date can be read without reading the future."""
+    if settings.reference_date > now.date():
+        return (
+            f"the reference date {settings.reference_date} is after the data's current "
+            f"date {now.date()}"
+        )
+    return None
+
+
+def _cap(d: date, now: datetime) -> date | datetime:
+    """An upper bound of "the whole of day d", but never later than ``now``:
+    a date bound on today's date would take in the rest of today."""
+    return now if d >= now.date() else d
+
+
+def _ref_bound(settings: Settings, now: datetime) -> date | datetime:
+    """The upper bound for reference-date lookups."""
+    return _cap(settings.reference_date, now)
+
+
+def _no_ref_reading(settings: Settings, now: datetime) -> str:
+    return _future_ref(settings, now) or (
+        f"no reading on or before the reference date {settings.reference_date}"
+    )
+
+
 # --- change since the war began, change since the last reading -------------------------
 
 
@@ -281,14 +306,14 @@ def change_since_war(
     before the reference date."""
     _check_now(now)
     cur = _recent(store, series, 1, now, settled_only=settled_only)
-    base = _on(store, series, settings.reference_date)
+    base = None if _future_ref(settings, now) else _on(store, series, _ref_bound(settings, now))
     return _change(
         cur[-1] if cur else None,
         base,
         unit=UNITS.get(series, ""),
         settings=_ref(settings),
         no_current=_no_data(series),
-        no_base=f"no reading on or before the reference date {settings.reference_date}",
+        no_base=_no_ref_reading(settings, now),
     )
 
 
@@ -318,13 +343,16 @@ def _days(store: Store, series: str, start: date | None, end: date | datetime) -
 
 
 def _baseline(
-    store: Store, series: str, settings: Settings
+    store: Store, series: str, settings: Settings, now: datetime
 ) -> tuple[float | None, date, date, int, str | None]:
     """Average of the settled days in the ``baseline_days`` days ending on
-    (and including) the reference date."""
+    (and including) the reference date. Not available when the reference
+    date is after ``now``."""
     end = settings.reference_date
     start = end - timedelta(days=settings.baseline_days - 1)
-    vals = list(_days(store, series, start, end).values())
+    if why := _future_ref(settings, now):
+        return None, start, end, 0, why
+    vals = list(_days(store, series, start, _ref_bound(settings, now)).values())
     need = math.ceil(settings.baseline_days * BASELINE_MIN_SHARE)
     if len(vals) < need:
         why = (
@@ -358,7 +386,7 @@ def percent_of_normal(
     excluded; zeros count."""
     _check_now(now)
     unit, cfg = "% of normal", _pon_settings(settings)
-    base, b_start, b_end, b_n, why = _baseline(store, series, settings)
+    base, b_start, b_end, b_n, why = _baseline(store, series, settings, now)
     newest = _recent(store, series, 1, now, settled_only=True)
     common = {
         "unit": unit,
@@ -372,7 +400,7 @@ def percent_of_normal(
         return PercentOfNormal(value=None, as_of=None, reason=_no_data(series), **common)
     end = newest[-1].day
     r_start = end - timedelta(days=RECENT_DAYS - 1)
-    recent, n = _trailing(_days(store, series, r_start, end), end)
+    recent, n = _trailing(_days(store, series, r_start, _cap(end, now)), end)
     common |= {
         "recent_average": recent,
         "recent_start": r_start,
@@ -399,7 +427,7 @@ def percent_of_normal_series(
     For the Hormuz chart line and the small chokepoint charts."""
     _check_now(now)
     unit, cfg = "% of normal", _pon_settings(settings)
-    base, *_, why = _baseline(store, series, settings)
+    base, *_, why = _baseline(store, series, settings, now)
     if base is None:
         return SeriesResult(value=None, unit=unit, as_of=None, settings=cfg, reason=why)
     newest = _recent(store, series, 1, now, settled_only=True)
@@ -410,7 +438,7 @@ def percent_of_normal_series(
     end = newest[-1].day
     if start is None:
         start = end - timedelta(days=SPARKLINE_DAYS - 1)
-    days = _days(store, series, start - timedelta(days=RECENT_DAYS - 1), end)
+    days = _days(store, series, start - timedelta(days=RECENT_DAYS - 1), _cap(end, now))
     out = []
     for d in sorted(days):
         if d < start:
@@ -449,7 +477,7 @@ def tank_cost(
     if not cur:
         return TankCost(value=None, unit="$", as_of=None, settings=cfg, reason=_no_data(series))
     price = cur[-1]
-    then = _on(store, series, settings.reference_date)
+    then = None if _future_ref(settings, now) else _on(store, series, _ref_bound(settings, now))
     common = {
         "value": price.value * g,
         "unit": "$",
@@ -458,14 +486,14 @@ def tank_cost(
         "price": price,
     }
     if then is None:
-        return TankCost(**common)
+        return TankCost(**common, then_reason=_no_ref_reading(settings, now))
     diff = (price.value - then.value) * g
     return TankCost(
         **common,
         then=then.value * g,
         then_as_of=then.day,
         change=diff,
-        percent=diff / (then.value * g) * 100,
+        percent=None if then.value == 0 else diff / (then.value * g) * 100,
     )
 
 
@@ -554,6 +582,10 @@ def crude_share(store: Store, pump_series: str = GASOLINE_US, *, now: datetime) 
     if not cur:
         return CrudeShare(value=None, unit=unit, as_of=None, reason=_no_data(pump_series))
     pump = cur[-1]
+    if pump.value == 0:
+        return CrudeShare(
+            value=None, unit=unit, as_of=pump.day, pump=pump, reason="the pump price is zero"
+        )
     target = pump.day - CRUDE_LAG
     brent = _on(store, BRENT, target)
     common = {"unit": unit, "as_of": pump.day, "pump": pump, "brent": brent, "brent_target": target}
@@ -613,7 +645,7 @@ def typical_range(
         cur = _recent(store, series, 1, now)
         p = cur[-1] if cur else None
     else:
-        p = _on(store, series, min(on, now.date()))
+        p = _on(store, series, _cap(on, now))
     if p is None:
         return TypicalRange(
             value=None, unit=unit, as_of=None, settings=cfg, reason=_no_data(series)
@@ -659,11 +691,13 @@ def typical_range_series(
 # --- headline tiles and the summary sentence ------------------------------------------
 
 
-def _sparkline(store: Store, series: str, as_of: date | None) -> tuple[DatedValue, ...]:
+def _sparkline(
+    store: Store, series: str, as_of: date | None, now: datetime
+) -> tuple[DatedValue, ...]:
     if as_of is None:
         return ()
     start = as_of - timedelta(days=SPARKLINE_DAYS - 1)
-    return tuple(_dv(p) for p in store.points(series, start, as_of))
+    return tuple(_dv(p) for p in store.points(series, start, _cap(as_of, now)))
 
 
 def _series_tile(
@@ -682,41 +716,48 @@ def _series_tile(
         reason=None if cur else _no_data(series),
         since_last=last,
         since_war=war,
-        sparkline=_sparkline(store, series, cur.day if cur else None),
-    )
-
-
-def _scale(c: Change, k: float, unit: str, settings: dict[str, object]) -> Change:
-    def s(x: DatedValue | None) -> DatedValue | None:
-        return DatedValue(x.day, x.value * k) if x else None
-
-    return Change(
-        value=None if c.value is None else c.value * k,
-        percent=c.percent,
-        unit=unit,
-        as_of=c.as_of,
-        settings=settings,
-        reason=c.reason,
-        current=s(c.current),
-        base=s(c.base),
+        sparkline=_sparkline(store, series, cur.day if cur else None, now),
     )
 
 
 def _tank_tile(store: Store, *, now: datetime, settings: Settings) -> Tile:
+    """Built on ``tank_cost``, so the tile and the panel share one definition."""
     g = settings.tank_gallons
-    cfg = {"tank_gallons": g, "reference_date": settings.reference_date}
-    t = _series_tile(store, "tank", "", GASOLINE_US, now=now, settings=settings)
+    tc = tank_cost(store, GASOLINE_US, now=now, settings=settings)
+    cur = DatedValue(tc.as_of, tc.value) if tc.value is not None else None
+    base = DatedValue(tc.then_as_of, tc.then) if tc.then is not None else None
+    since_war = Change(
+        value=tc.change,
+        percent=tc.percent,
+        unit="$",
+        as_of=tc.as_of,
+        settings=tc.settings,
+        reason=tc.reason or tc.then_reason,
+        current=cur,
+        base=base,
+    )
+    pts = _recent(store, GASOLINE_US, 2, now)
+    since_last = _change(
+        DatedValue(pts[-1].day, pts[-1].value * g) if pts else None,
+        DatedValue(pts[-2].day, pts[-2].value * g) if len(pts) == 2 else None,
+        unit="$",
+        settings={"tank_gallons": g},
+        no_current=_no_data(GASOLINE_US),
+        no_base="only one reading so far",
+    )
     return Tile(
         key="tank",
         label=f"Cost to fill a {g:g}-gallon tank",
-        value=None if t.value is None else t.value * g,
+        value=tc.value,
         unit="$",
-        as_of=t.as_of,
-        settings=cfg,
-        reason=t.reason,
-        since_last=_scale(t.since_last, g, "$", {"tank_gallons": g}),
-        since_war=_scale(t.since_war, g, "$", cfg),
-        sparkline=tuple(DatedValue(p.day, p.value * g) for p in t.sparkline),
+        as_of=tc.as_of,
+        settings=tc.settings,
+        reason=tc.reason,
+        since_last=since_last,
+        since_war=since_war,
+        sparkline=tuple(
+            DatedValue(p.day, p.value * g) for p in _sparkline(store, GASOLINE_US, tc.as_of, now)
+        ),
     )
 
 
@@ -729,9 +770,12 @@ def _hormuz_tile(store: Store, *, now: datetime, settings: Settings) -> Tile:
     now_dv = DatedValue(cur.as_of, cur.value) if cur.value is not None else None
     prev = pts[-2] if now_dv and len(pts) >= 2 and pts[-1].day == now_dv.day else None
     base = None
-    if cur.baseline_average is not None:
+    if cur.baseline_average is not None:  # implies the reference date is not after now
         ref = settings.reference_date
-        avg, _ = _trailing(_days(store, HORMUZ, ref - timedelta(days=RECENT_DAYS - 1), ref), ref)
+        window = _days(
+            store, HORMUZ, ref - timedelta(days=RECENT_DAYS - 1), _ref_bound(settings, now)
+        )
+        avg, _ = _trailing(window, ref)
         if avg is not None:
             base = DatedValue(ref, avg / cur.baseline_average * 100)
     no_cur = cur.reason or _no_data(HORMUZ)
@@ -752,7 +796,7 @@ def _hormuz_tile(store: Store, *, now: datetime, settings: Settings) -> Tile:
             unit=unit,
             settings=cfg,
             no_current=no_cur,
-            no_base="not enough days around the reference date",
+            no_base=_future_ref(settings, now) or "not enough days around the reference date",
         ),
         sparkline=pts,
     )
@@ -804,62 +848,76 @@ def _cents(x: float) -> str:
     return f"{c} cent" if c == 1 else f"{c} cents"
 
 
-def _pct(c: Change) -> str:
-    return f"{abs(c.percent):.0f}%"
-
-
-def _price_change(c: Change) -> str:
-    return _cents(c.value)
-
-
-def summary_text(tiles_: Iterable[Tile]) -> str:
-    """One plain-English sentence from fixed templates. Clauses whose data is
-    missing are left out; with nothing to say it says so. "Since the war
-    began" is said once, on the first change mentioned."""
+def _summary(tiles_: Iterable[Tile]) -> tuple[str, list[Tile]]:
+    """The sentence and the tiles it actually uses."""
     by = {t.key: t for t in tiles_}
     clauses: list[str] = []
+    used: list[Tile] = []
     since = " since the war began"
 
-    def direction(c: Change, amount: Callable[[Change], str]) -> str:
+    def direction(c: Change, by_percent: bool) -> str:
         nonlocal since
         if c.value is None or c.percent is None:
             return ""
         s, since = since, ""
         if abs(c.percent) < FLAT_PERCENT:
             return f", little changed{s}"
-        return f", {'up' if c.value > 0 else 'down'} {amount(c)}{s}"
+        amount = f"{abs(c.percent):.0f}%" if by_percent else _cents(c.value)
+        return f", {'up' if c.value > 0 else 'down'} {amount}{s}"
 
     if (t := by.get("brent")) and t.value is not None:
-        clauses.append(f"Brent crude is {_money(t.value)} a barrel{direction(t.since_war, _pct)}")
+        d = direction(t.since_war, by_percent=True)
+        clauses.append(f"Brent crude is {_money(t.value)} a barrel{d}")
+        used.append(t)
     if (t := by.get("gasoline")) and t.value is not None:
-        d = direction(t.since_war, _price_change)
+        d = direction(t.since_war, by_percent=False)
         clauses.append(f"US gasoline is {_money(t.value)} a gallon{d}")
+        used.append(t)
     if (t := by.get("hormuz")) and t.value is not None:
         if t.value == 0:
             clauses.append("no ships are crossing the Strait of Hormuz")
+        elif round(t.value) == 0:
+            # Some ships did cross: "0% of normal" would overstate, "no ships" would be false.
+            clauses.append("almost no ships are crossing the Strait of Hormuz")
         else:
             clauses.append(f"ships crossing the Strait of Hormuz are at {t.value:.0f}% of normal")
+        used.append(t)
     if (t := by.get("crude_stocks")) and t.typical_range and t.typical_range.position:
         clauses.append(
             f"US crude stocks are {t.typical_range.position} the typical range "
             "for this time of year"
         )
+        used.append(t)
     if not clauses:
-        return "Not enough data has come in yet to sum things up."
-    if len(clauses) > 1:
-        clauses[-1] = "and " + clauses[-1]
-    text = "; ".join(clauses) + "."
-    return text[0].upper() + text[1:]
+        return "Not enough data has come in yet to sum things up.", []
+    if len(clauses) == 1:
+        text = clauses[0]
+    elif len(clauses) == 2:
+        text = f"{clauses[0]}, and {clauses[1]}"
+    else:
+        text = "; ".join(clauses[:-1]) + f"; and {clauses[-1]}"
+    return text[0].upper() + text[1:] + ".", used
+
+
+def summary_text(tiles_: Iterable[Tile]) -> str:
+    """One plain-English sentence from fixed templates. Clauses whose data is
+    missing are left out; with nothing to say it says so. "Since the war
+    began" is said once, on the first change mentioned. Two clauses join
+    with ", and"; three or more with semicolons."""
+    return _summary(tiles_)[0]
 
 
 def summary(store: Store, *, now: datetime, settings: Settings) -> Summary:
-    """The headline strip: the summary sentence and its six tiles."""
+    """The headline strip: the summary sentence and its six tiles. ``as_of``
+    is the oldest as-of among the tiles the sentence uses, so the sentence
+    never looks fresher than its stalest number; each tile keeps its own."""
     ts = tiles(store, now=now, settings=settings)
-    dates = [t.as_of for t in ts if t.as_of]
+    text, used = _summary(ts)
+    dates = [t.as_of for t in used if t.as_of]
     return Summary(
-        text=summary_text(ts),
+        text=text,
         tiles=ts,
-        as_of=max(dates) if dates else None,
+        as_of=min(dates) if dates else None,
         settings={
             "reference_date": settings.reference_date,
             "baseline_days": settings.baseline_days,

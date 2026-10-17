@@ -49,6 +49,14 @@ def weekdays(start: date, end: date):
     return (d for d in days(start, end) if d.weekday() < 5)
 
 
+WEEKLY_STOCKS = (
+    "eia.stocks.crude_commercial",
+    "eia.stocks.gasoline",
+    "eia.stocks.distillate",
+    "eia.stocks.spr",
+)
+
+
 # --- defaults and series ids ----------------------------------------------------------
 
 
@@ -60,7 +68,7 @@ def test_default_settings(settings):
 
 def test_every_series_id_exists_in_a_collector():
     known = {s.id for s in (*eia.SERIES, *portwatch.SERIES, *eu_oil_bulletin.SERIES)}
-    used = {calc.BRENT, calc.WTI, calc.CRUDE_STOCKS, calc.HORMUZ, *calc.WEEKLY_STOCKS}
+    used = {calc.BRENT, calc.WTI, calc.CRUDE_STOCKS, calc.HORMUZ, *WEEKLY_STOCKS}
     used |= set(calc.CHOKEPOINT_SERIES.values())
     used |= {calc.gasoline(r) for r in calc.REGIONS} | {calc.diesel(r) for r in calc.REGIONS}
     assert used <= known
@@ -624,7 +632,9 @@ def test_summary_rising(store, settings):
     scenario(store, brent=91.0, gas=3.41, hormuz=12.0, stocks=380.0)
     s = calc.summary(store, now=NOW, settings=settings)
     assert s.text == RISING
-    assert s.as_of == date(2026, 10, 14) and len(s.tiles) == 6
+    # The oldest as-of the sentence uses: crude stocks, week ending Oct 9.
+    assert s.as_of == date(2026, 10, 9) and len(s.tiles) == 6
+    assert {t.key: t.as_of for t in s.tiles}["brent"] == date(2026, 10, 14)
     assert s.settings == {"reference_date": REF, "baseline_days": 90, "tank_gallons": 15.0}
 
 
@@ -658,9 +668,45 @@ def test_summary_partial_data(store, settings):
     put(store, calc.BRENT, {date(2026, 10, 14): 91.0})
     put(store, calc.GASOLINE_US, {date(2026, 2, 23): 3.0, date(2026, 10, 12): 3.02})
     assert calc.summary(store, now=NOW, settings=settings).text == (
-        "Brent crude is $91.00 a barrel; "
+        "Brent crude is $91.00 a barrel, "
         "and US gasoline is $3.02 a gallon, up 2 cents since the war began."
     )
+
+
+def test_summary_three_clauses_and_as_of_ignores_unused_tiles(store, settings):
+    put(store, calc.BRENT, {REF: 70.0, date(2026, 10, 14): 91.0})
+    put(store, calc.GASOLINE_US, {date(2026, 2, 23): 3.0, date(2026, 10, 12): 3.41})
+    put(store, calc.DIESEL_US, {date(2026, 10, 12): 4.0})  # a tile, not in the sentence
+    hormuz_history(store, {d: 50.0 for d in days(date(2026, 10, 5), date(2026, 10, 11))})
+    put(store, calc.CRUDE_STOCKS, {date(2026, 10, 2): 400.0})  # no typical range: not used
+    s = calc.summary(store, now=NOW, settings=settings)
+    assert s.text == (
+        "Brent crude is $91.00 a barrel, up 30% since the war began; "
+        "US gasoline is $3.41 a gallon, up 41 cents; "
+        "and ships crossing the Strait of Hormuz are at 50% of normal."
+    )
+    assert s.as_of == date(2026, 10, 11)  # Hormuz; the Oct 2 stocks tile is not in it
+
+
+def test_summary_as_of_two_clauses(store, settings):
+    put(store, calc.BRENT, {REF: 70.0, date(2026, 10, 14): 91.0})
+    put(store, calc.GASOLINE_US, {date(2026, 2, 23): 3.0, date(2026, 10, 12): 3.41})
+    s = calc.summary(store, now=NOW, settings=settings)
+    assert s.text.count(", and ") == 1 and ";" not in s.text
+    assert s.as_of == date(2026, 10, 12)
+
+
+@pytest.mark.parametrize(
+    ("level", "text"),
+    [
+        (0.3, "Almost no ships are crossing the Strait of Hormuz."),  # 0.3% of normal
+        (0.0, "No ships are crossing the Strait of Hormuz."),
+        (0.6, "Ships crossing the Strait of Hormuz are at 1% of normal."),
+    ],
+)
+def test_summary_near_zero_hormuz(store, settings, level, text):
+    hormuz_history(store, {d: level for d in days(date(2026, 10, 5), date(2026, 10, 11))})
+    assert calc.summary(store, now=NOW, settings=settings).text == text
 
 
 def test_summary_single_clause(store, settings):
@@ -727,3 +773,115 @@ def test_summary_and_tile_labels_are_plain_language(store, settings, case):
     assert _jargon_in(s.text, JARGON) == []
     for t in s.tiles:
         assert _jargon_in(t.label, [w for w in JARGON if w not in TILE_LABEL_EXCEPTIONS]) == []
+
+
+# --- now before the reference date: nothing newer than now is read -------------------
+
+EARLY = datetime(2026, 2, 21, 12, 0, tzinfo=UTC)  # six days before the reference date
+FUTURE_REF = "the reference date 2026-02-27 is after the data's current date 2026-02-21"
+
+
+def test_change_since_war_now_before_reference_date(store, settings):
+    put(store, calc.BRENT, {date(2026, 2, 20): 60.0, REF: 70.0})
+    c = calc.change_since_war(store, calc.BRENT, now=EARLY, settings=settings)
+    assert c.value is None and c.percent is None and c.base is None
+    assert c.reason == FUTURE_REF
+    assert c.current == calc.DatedValue(date(2026, 2, 20), 60.0)
+
+
+def test_reference_date_today_reads_nothing_after_now(store):
+    # Reference date = today: the lookup is capped at now, not the whole day.
+    store.set_setting("reference_date", "2026-02-21")
+    put(store, calc.BRENT, {date(2026, 2, 20): 60.0})
+    store.upsert_points([Point(calc.BRENT, EARLY + timedelta(hours=6), 99.0)], fetched_at=EARLY)
+    c = calc.change_since_war(store, calc.BRENT, now=EARLY, settings=store.settings())
+    assert c.base == calc.DatedValue(date(2026, 2, 20), 60.0) and c.value == 0.0
+
+
+def test_percent_of_normal_now_before_reference_date(store, settings):
+    hormuz_history(store, {})
+    for r in (
+        calc.percent_of_normal(store, now=EARLY, settings=settings),
+        calc.percent_of_normal_series(store, now=EARLY, settings=settings),
+    ):
+        assert r.value is None and r.reason == FUTURE_REF
+    r = calc.percent_of_normal(store, now=EARLY, settings=settings)
+    assert r.baseline_average is None and r.baseline_days_with_data == 0
+    assert r.recent_end == date(2026, 2, 21)  # the recent side stops at now
+    out = calc.chokepoints_vs_normal(store, now=EARLY, settings=settings)
+    assert out["hormuz"].reason == FUTURE_REF
+
+
+def test_tank_cost_now_before_reference_date(store, settings):
+    put(store, calc.GASOLINE_US, {date(2026, 2, 16): 2.9, date(2026, 2, 23): 3.0})
+    t = calc.tank_cost(store, now=EARLY, settings=settings)
+    assert t.value == pytest.approx(43.5) and t.as_of == date(2026, 2, 16)  # 2.90 x 15
+    assert t.then is None and t.change is None and t.percent is None
+    assert t.then_reason == FUTURE_REF
+
+
+def test_tiles_now_before_reference_date(store, settings):
+    scenario(store, brent=91.0, gas=3.41, hormuz=12.0, stocks=380.0)
+    ts = {t.key: t for t in calc.tiles(store, now=EARLY, settings=settings)}
+    for key in ("brent", "gasoline", "diesel", "tank", "hormuz", "crude_stocks"):
+        assert ts[key].since_war.value is None
+        assert ts[key].since_war.reason == FUTURE_REF
+        assert ts[key].as_of is None or ts[key].as_of <= EARLY.date()
+    assert ts["brent"].value == 70.0 and ts["tank"].value == pytest.approx(45.0)
+    assert ts["hormuz"].value is None and ts["hormuz"].reason == FUTURE_REF
+
+
+@pytest.mark.parametrize("now", [EARLY, datetime(2026, 2, 27, 6, 0, tzinfo=UTC), NOW])
+def test_no_read_goes_past_now(store, settings, now, monkeypatch):
+    scenario(store, brent=91.0, gas=3.41, hormuz=12.0, stocks=380.0)
+    bounds = []
+    real_points, real_value_on = store.points, store.value_on
+
+    def points(series, start=None, end=None, **kw):
+        bounds.append(end)
+        return real_points(series, start, end, **kw)
+
+    def value_on(series, on):
+        bounds.append(on)
+        return real_value_on(series, on)
+
+    monkeypatch.setattr(store, "points", points)
+    monkeypatch.setattr(store, "value_on", value_on)
+    calc.summary(store, now=now, settings=settings)
+    calc.crude_share(store, now=now)
+    calc.typical_range(store, now=now)
+    calc.chokepoints_vs_normal(store, now=now, settings=settings)
+    calc.tank_cost(store, now=now, settings=settings)
+    assert bounds and None not in bounds
+    for b in bounds:
+        if isinstance(b, datetime):
+            assert b <= now
+        else:  # a date bound covers its whole day: only before today
+            assert b <= now.date()
+            if b == now.date():
+                pytest.fail(f"whole-day bound on today's date {b}")
+
+
+# --- zero prices do not raise ---------------------------------------------------------
+
+
+def test_tank_cost_zero_reference_price(store, settings):
+    put(store, calc.GASOLINE_US, {date(2026, 2, 23): 0.0, date(2026, 10, 12): 3.0})
+    t = calc.tank_cost(store, now=NOW, settings=settings)
+    assert t.then == 0.0 and t.change == pytest.approx(45.0) and t.percent is None
+
+
+def test_crude_share_zero_pump_price(store):
+    brent_daily(store)
+    put(store, calc.GASOLINE_US, {date(2026, 10, 12): 0.0})
+    s = calc.crude_share(store, now=NOW)
+    assert s.value is None and s.reason == "the pump price is zero" and s.estimate
+
+
+def test_tank_tile_matches_tank_cost(store, settings):
+    scenario(store, brent=91.0, gas=3.41, hormuz=12.0, stocks=380.0)
+    tile = {t.key: t for t in calc.tiles(store, now=NOW, settings=settings)}["tank"]
+    tc = calc.tank_cost(store, now=NOW, settings=settings)
+    assert (tile.value, tile.as_of, tile.settings) == (tc.value, tc.as_of, tc.settings)
+    assert tile.since_war.value == tc.change and tile.since_war.percent == tc.percent
+    assert tile.since_war.base == calc.DatedValue(tc.then_as_of, tc.then)
