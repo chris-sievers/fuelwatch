@@ -30,7 +30,10 @@ from fuelwatch.collectors.aisstream import (
 )
 from fuelwatch.http import redact
 
-SESSION_SECONDS = 60
+# Class A ships send static data (AIS message 5, ShipStaticData) only every
+# 6 minutes, so the session runs until both types have arrived, capped a
+# little above that interval.
+SESSION_SECONDS = 420
 # Hormuz traffic may be thin or jammed, so a busy box (Strait of Dover)
 # guarantees enough frames to check the shape.
 DOVER = [[50.8, 1.0], [51.2, 1.8]]
@@ -71,7 +74,7 @@ async def _session(key: str) -> dict:
                 }
             )
         )
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not set(MESSAGE_TYPES) <= found.keys():
             try:
                 raw = await asyncio.wait_for(ws.recv(), deadline - time.monotonic())
             except TimeoutError:
