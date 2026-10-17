@@ -8,7 +8,7 @@ Entry point for the app::
     sched = Scheduler(store)          # sched.ais: the AIS collector or None
     task = asyncio.create_task(sched.run(stop))
     ...
-    stop.set(); await task
+    stop.set(); await task            # then store.close() is safe
 
 or ``await scheduler.run(store, stop)``.
 
@@ -33,17 +33,24 @@ period: 14 days for EIA, PortWatch's 35-day REVISION_WINDOW (and a full
 five-year refresh every 28 days), and the newest stored Monday for the EU
 bulletin (which keeps it on the small latest-prices file).
 
-Collectors run as separate tasks: one raising never stops the others. Each
-run records success or failure in the status table; the store keeps only
-a ProviderError's class and sanitized message, or 'internal' and the
-exception type for anything else.
+Collectors run as separate tasks: one raising never stops the others, and
+every loop survives any exception (a failing store included) by logging it
+sanitized and backing off. Each run records success or failure in the
+status table; the store keeps only a ProviderError's class and sanitized
+message, or 'internal' and the exception type for anything else.
+
+A collector polls once its backfill is done, or once its backfill attempt
+has failed (the backfill keeps retrying in the background), or if the
+backfill task has ended.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import random
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -52,10 +59,11 @@ import httpx
 
 from fuelwatch import backfill
 from fuelwatch.collectors.aisstream import AisStreamCollector
-from fuelwatch.http import PacedClient, ProviderError, make_client
+from fuelwatch.http import PacedClient, ProviderError, Stopped, make_client, redact
 from fuelwatch.models import Point
 from fuelwatch.registry import REGISTRY, Collector, Registry, next_release, pending_release
 from fuelwatch.store import BackfillState, Store
+from fuelwatch.threads import ThreadCalls
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +78,8 @@ BACKFILL_CHECK = 30.0  # seconds between checks while waiting for a backfill
 AIS_STATUS_CHECK = 60.0
 AIS_RESTART_START = 1.0
 AIS_RESTART_MAX = 300.0
-SHUTDOWN_GRACE = 5.0
+SHUTDOWN_GRACE = 5.0  # seconds for loops to finish before they are cancelled
+DRAIN_TIMEOUT = 10.0  # seconds to wait for store writes still in worker threads
 
 AIS_NAME = "aisstream"
 
@@ -95,8 +104,21 @@ class PollResult:
 
 
 def backoff(failures: int, base: timedelta = RETRY_BASE, cap: timedelta = RETRY_MAX) -> timedelta:
-    """Delay after `failures` consecutive failures (1 or more)."""
-    return min(base * 2 ** max(0, failures - 1), cap)
+    """Delay after `failures` consecutive failures (1 or more). The exponent
+    is capped so a long outage cannot overflow timedelta."""
+    return min(base * 2 ** min(max(0, failures - 1), 20), cap)
+
+
+def _message(e: BaseException) -> str:
+    return redact(str(e)) if isinstance(e, ProviderError) else type(e).__name__
+
+
+def _log_failure(what: str, e: BaseException) -> None:
+    if isinstance(e, ProviderError):
+        log.warning("%s failed: %s", what, _message(e))
+    else:
+        log.error("%s: internal error %s", what, type(e).__name__)
+        log.debug("%s traceback", what, exc_info=e)  # redacted by RedactingFilter
 
 
 class Scheduler:
@@ -110,6 +132,7 @@ class Scheduler:
         ais: AisStreamCollector | None | _Auto = AUTO,
         run_backfill: bool = True,
         now: Callable[[], datetime] = _utcnow,
+        monotonic: Callable[[], float] = time.monotonic,
         idle_interval: timedelta = IDLE_INTERVAL,
         hot_interval: timedelta = HOT_INTERVAL,
         retry_base: timedelta = RETRY_BASE,
@@ -120,10 +143,13 @@ class Scheduler:
     ) -> None:
         self.store = store
         self.registry = registry
-        self.collectors = tuple(c for c in (collectors or registry.polled) if c.polled)
+        # None: every polled collector. An empty list means none.
+        chosen = registry.polled if collectors is None else collectors
+        self.collectors = tuple(c for c in chosen if c.polled)
         self.ais = AisStreamCollector.from_env() if isinstance(ais, _Auto) else ais
         self.run_backfill = run_backfill
         self.now = now
+        self.monotonic = monotonic
         self.idle_interval = idle_interval
         self.hot_interval = hot_interval
         self.retry_base = retry_base
@@ -135,6 +161,9 @@ class Scheduler:
         self._raw_client = client
         self.http: PacedClient | None = backfill.paced(client) if client is not None else None
         self.failures: dict[str, int] = {c.name: 0 for c in self.collectors}
+        self.io = ThreadCalls()  # every store call; drained at shutdown
+        self._backfill_task: asyncio.Task | None = None
+        self._backfill_failed: set[str] = set()
 
     # --- one poll ------------------------------------------------------------------
 
@@ -145,7 +174,7 @@ class Scheduler:
         return self.http
 
     async def _latest(self, c: Collector) -> dict[str, datetime | None]:
-        latest = await asyncio.to_thread(self.store.series_latest)
+        latest = await self.io(self.store.series_latest)
         return {s.id: (latest[s.id].period_end if s.id in latest else None) for s in c.series}
 
     def since_for(self, c: Collector, latest: dict[str, datetime | None]) -> date:
@@ -156,13 +185,13 @@ class Scheduler:
 
     async def poll(self, c: Collector) -> PollResult:
         """Run one incremental fetch and write it. Records the outcome in
-        status; never raises except on cancellation."""
+        status when the store allows; never raises except on cancellation."""
         since: date | None = None
         try:
             since = self.since_for(c, await self._latest(c))
             full = False
             if c.full_refresh_every is not None:
-                bf = await asyncio.to_thread(self.store.get_backfill, c.name)
+                bf = await self.io(self.store.get_backfill, c.name)
                 full = (
                     bf.state == BackfillState.DONE
                     and bf.updated_at is not None
@@ -171,29 +200,32 @@ class Scheduler:
             if full:
                 since = None
                 log.info("%s: periodic full refresh", c.name)
-            points: list[Point] = await c.fetch(self._http(), since)
-            n = await asyncio.to_thread(self.store.upsert_points, points)
+            http = self._http()
+            points: list[Point] = await backfill.unless_stopped(c.fetch(http, since), http.stop)
+            n = await self.io(self.store.upsert_points, points)
             if full:
-                await asyncio.to_thread(
-                    self.store.set_backfill, c.name, BackfillState.DONE, None, 1.0
-                )
-            await asyncio.to_thread(self.store.record_success, c.name)
+                await self.io(self.store.set_backfill, c.name, BackfillState.DONE, None, 1.0)
+            await self.io(self.store.record_success, c.name)
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # one collector must not stop the others
+        except Exception as e:  # noqa: BLE001 - one collector must not stop the others
             self.failures[c.name] = self.failures.get(c.name, 0) + 1
-            await asyncio.to_thread(self.store.record_failure, c.name, e)
-            status = await asyncio.to_thread(self.store.get_status, c.name)
-            msg = status.error_message if status else type(e).__name__
-            if isinstance(e, ProviderError):
-                log.warning("%s poll failed: %s", c.name, msg)
-            else:
-                log.error("%s poll: internal error %s", c.name, type(e).__name__)
-                log.debug("%s traceback", c.name, exc_info=True)
-            return PollResult(c.name, since, error=msg)
+            if not isinstance(e, Stopped):
+                _log_failure(f"{c.name} poll", e)
+                await self._record_failure(c.name, e)
+            return PollResult(c.name, since, error=_message(e))
         self.failures[c.name] = 0
         log.info("%s: %d points since %s", c.name, n, since)
         return PollResult(c.name, since, n)
+
+    async def _record_failure(self, name: str, e: BaseException) -> None:
+        """Best effort: the store may be what failed."""
+        try:
+            await self.io(self.store.record_failure, name, e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - logged; the caller backs off
+            log.error("%s: could not record the failure: %s", name, type(err).__name__)
 
     async def poll_all(self) -> list[PollResult]:
         """Poll every collector once, concurrently (``collect --once``)."""
@@ -207,10 +239,13 @@ class Scheduler:
     def _jitter(self, d: timedelta) -> timedelta:
         return d * random.uniform(1 - self.jitter, 1 + self.jitter) if self.jitter else d
 
+    def _backoff(self, failures: int) -> timedelta:
+        return self._jitter(backoff(failures, self.retry_base, self.retry_max))
+
     async def next_delay(self, c: Collector) -> timedelta:
         failures = self.failures.get(c.name, 0)
         if failures:
-            return self._jitter(backoff(failures, self.retry_base, self.retry_max))
+            return self._backoff(failures)
         return self.cadence(c, await self._latest(c))
 
     def cadence(self, c: Collector, latest: dict[str, datetime | None]) -> timedelta:
@@ -233,7 +268,7 @@ class Scheduler:
         """After a restart, wait out the rest of the interval since the last
         run instead of polling at once, so a crash loop cannot hammer a
         provider."""
-        status = await asyncio.to_thread(self.store.get_status, c.name)
+        status = await self.io(self.store.get_status, c.name)
         delay = await self.next_delay(c)
         if status is None or status.last_run_at is None:
             return timedelta(0)
@@ -244,11 +279,27 @@ class Scheduler:
 
     # --- loops ---------------------------------------------------------------------
 
+    def _backfill_result(self, r: backfill.Result) -> None:
+        if r.error is not None:
+            self._backfill_failed.add(r.collector)
+
     async def _wait_backfill(self, c: Collector, stop: asyncio.Event) -> bool:
+        """True once `c` may poll: its backfill is done or has failed, or the
+        backfill task is not running. False if `stop` was set."""
         while not stop.is_set():
-            bf = await asyncio.to_thread(self.store.get_backfill, c.name)
-            if bf.state == BackfillState.DONE:
+            if c.name in self._backfill_failed:
                 return True
+            task = self._backfill_task
+            if task is None or task.done():
+                return True
+            try:
+                bf = await self.io(self.store.get_backfill, c.name)
+                if bf.state == BackfillState.DONE:
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - keep waiting; the store may recover
+                _log_failure(f"{c.name} backfill check", e)
             if await backfill.wait_or_stop(stop, self.backfill_check):
                 return False
         return False
@@ -256,12 +307,29 @@ class Scheduler:
     async def _collector_loop(self, c: Collector, stop: asyncio.Event) -> None:
         if self.run_backfill and not await self._wait_backfill(c, stop):
             return
-        delay = await self.first_delay(c)
+        guard_failures = 0
+        try:
+            delay = await self.first_delay(c)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - poll after the first backoff step
+            _log_failure(f"{c.name} first delay", e)
+            delay = self._backoff(1)
         while not stop.is_set():
             if await backfill.wait_or_stop(stop, delay.total_seconds()):
                 return
-            await self.poll(c)
-            delay = await self.next_delay(c)
+            try:
+                await self.poll(c)
+                delay = await self.next_delay(c)
+                guard_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - a loop must never die
+                guard_failures += 1
+                _log_failure(f"{c.name} loop", e)
+                delay = self.retry_max  # cannot raise, unlike anything computed
+                with contextlib.suppress(Exception):
+                    delay = self._backoff(max(guard_failures, self.failures.get(c.name, 0)))
             log.debug("%s: next poll in %s", c.name, delay)
 
     async def _ais_loop(self, stop: asyncio.Event) -> None:
@@ -270,10 +338,10 @@ class Scheduler:
 
         async def sink(points: list[Point]) -> None:
             try:
-                await asyncio.to_thread(self.store.upsert_points, points)
-                await asyncio.to_thread(self.store.record_success, AIS_NAME)
+                await self.io(self.store.upsert_points, points)
+                await self.io(self.store.record_success, AIS_NAME)
             except Exception as e:
-                await asyncio.to_thread(self.store.record_failure, AIS_NAME, e)
+                await self._record_failure(AIS_NAME, e)
                 raise
 
         async def mirror_status() -> None:
@@ -284,21 +352,25 @@ class Scheduler:
                 st = ais.status
                 cur = (st.error_class, st.message) if st.error_class else None
                 if cur is not None and cur != last:
-                    err = ProviderError(st.error_class, st.message or "")
-                    await asyncio.to_thread(self.store.record_failure, AIS_NAME, err)
+                    await self._record_failure(
+                        AIS_NAME, ProviderError(st.error_class, st.message or "")
+                    )
                 last = cur
 
         watcher = asyncio.create_task(mirror_status())
         delay = AIS_RESTART_START
         try:
             while not stop.is_set():
+                started = self.monotonic()
                 try:
                     await ais.run(sink, stop)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:  # noqa: BLE001 - keep the rest of the app alive
-                    log.error("AIS stream crashed: %s", type(e).__name__)
-                    await asyncio.to_thread(self.store.record_failure, AIS_NAME, e)
+                    _log_failure("AIS stream", e)
+                    await self._record_failure(AIS_NAME, e)
+                    if self.monotonic() - started >= AIS_RESTART_MAX:
+                        delay = AIS_RESTART_START  # it ran healthily; start the backoff over
                     if await backfill.wait_or_stop(stop, delay):
                         break
                     delay = min(delay * 2, AIS_RESTART_MAX)
@@ -308,33 +380,60 @@ class Scheduler:
 
     async def run(self, stop: asyncio.Event) -> None:
         """Run until `stop` is set, then shut down: loops finish at their
-        next wait, anything still busy after SHUTDOWN_GRACE is cancelled,
-        and a client this scheduler created is closed."""
+        next wait (provider waits end at once), anything still busy after
+        SHUTDOWN_GRACE is cancelled, store calls already running in worker
+        threads are waited for (up to DRAIN_TIMEOUT), and a client this
+        scheduler created is closed. The store can be closed after this."""
         http = self._http()
+        http.stop = stop
         tasks: list[asyncio.Task] = []
+
+        def watch(task: asyncio.Task) -> asyncio.Task:
+            def done(t: asyncio.Task) -> None:
+                if t.cancelled():
+                    return
+                if t.exception() is not None:
+                    log.error("task %s died: %s", t.get_name(), type(t.exception()).__name__)
+                elif not stop.is_set():
+                    log.warning("task %s ended before stop", t.get_name())
+
+            task.add_done_callback(done)
+            tasks.append(task)
+            return task
+
         if self.run_backfill:
-            tasks.append(
+            self._backfill_task = watch(
                 asyncio.create_task(
-                    backfill.run(self.store, http, collectors=self.collectors, stop=stop),
+                    backfill.run(
+                        self.store,
+                        http,
+                        collectors=self.collectors,
+                        stop=stop,
+                        io=self.io,
+                        on_result=self._backfill_result,
+                    ),
                     name="backfill",
                 )
             )
         for c in self.collectors:
-            tasks.append(asyncio.create_task(self._collector_loop(c, stop), name=f"poll:{c.name}"))
+            watch(asyncio.create_task(self._collector_loop(c, stop), name=f"poll:{c.name}"))
         if self.ais is not None:
-            tasks.append(asyncio.create_task(self._ais_loop(stop), name="ais"))
+            watch(asyncio.create_task(self._ais_loop(stop), name="ais"))
         else:
             log.info("live AIS off: %s not set", "AISSTREAM_API_KEY")
         try:
             await stop.wait()
-            _, still = await asyncio.wait(tasks, timeout=SHUTDOWN_GRACE)
-            for t in still:
-                t.cancel()
+            if tasks:
+                _, still = await asyncio.wait(tasks, timeout=SHUTDOWN_GRACE)
+                for t in still:
+                    t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if not await self.io.drain(DRAIN_TIMEOUT):
+                log.warning("store calls still running after %.0f s", DRAIN_TIMEOUT)
             await self.aclose()
 
     async def aclose(self) -> None:

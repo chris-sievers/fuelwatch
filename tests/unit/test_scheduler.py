@@ -1,4 +1,6 @@
 import asyncio
+import sqlite3
+import threading
 from datetime import UTC, date, datetime, timedelta
 from urllib.parse import parse_qs
 
@@ -20,6 +22,13 @@ NOW = datetime(2026, 10, 17, 12, tzinfo=UTC)  # a Saturday
 
 def day(y, m, d):
     return datetime(y, m, d, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def small_fakes_are_plausible(monkeypatch):
+    from fuelwatch import backfill
+
+    monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 0)
 
 
 @pytest.fixture
@@ -181,6 +190,8 @@ def test_backoff_doubles_to_cap():
     assert backoff(2) == timedelta(minutes=20)
     assert backoff(4) == timedelta(minutes=80)
     assert backoff(20) == timedelta(hours=6)
+    big = timedelta(days=10**6)
+    assert backoff(10**6, timedelta(minutes=10), big) == timedelta(minutes=10 * 2**20)
 
 
 async def test_next_delay_backs_off_and_resets(store, client):
@@ -259,21 +270,29 @@ def fast(store, client, collectors, **kw):
     )
 
 
+async def until(cond, timeout=5.0):
+    """Wait for a condition, yielding to the loop; the timeout only bounds a
+    broken test."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not cond():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not met")
+        await asyncio.sleep(0.001)
+
+
 async def test_loop_isolation_and_clean_stop(store, client):
     good = Fake([brent(day(2026, 10, 13))])
     bad = Fake(error=RuntimeError("x"))
     s = fast(store, client, [like("eia", good), like("portwatch", bad)], run_backfill=False)
     stop = asyncio.Event()
     task = asyncio.create_task(s.run(stop))
-    await asyncio.sleep(0.3)
-    assert len(good.calls) >= 3
-    assert len(bad.calls) >= 2
-    # Backoff: the failing collector polls less often than the good one.
-    assert len(bad.calls) < len(good.calls)
+    await until(lambda: len(good.calls) >= 3 and len(bad.calls) >= 3)
+    assert s.failures["portwatch"] >= 3 and s.failures["eia"] == 0
     stop.set()
     await asyncio.wait_for(task, timeout=2)
     n = len(good.calls)
-    await asyncio.sleep(0.05)
+    for _ in range(10):
+        await asyncio.sleep(0)
     assert len(good.calls) == n
     assert not client.is_closed  # the caller's client is left open
 
@@ -282,7 +301,7 @@ async def test_run_closes_its_own_client(store):
     s = fast(store, None, [like("eia", Fake())], run_backfill=False)
     stop = asyncio.Event()
     task = asyncio.create_task(s.run(stop))
-    await asyncio.sleep(0.05)
+    await until(lambda: s._raw_client is not None)
     raw = s._raw_client
     stop.set()
     await asyncio.wait_for(task, timeout=2)
@@ -294,56 +313,179 @@ async def test_polling_waits_for_backfill(store, client):
     s = fast(store, client, [like("eia", f)], run_backfill=True)
     stop = asyncio.Event()
     task = asyncio.create_task(s.run(stop))
-    await asyncio.sleep(0.2)
+    await until(lambda: len(f.calls) >= 2)
     stop.set()
     await asyncio.wait_for(task, timeout=2)
     assert f.calls[0] is None  # the backfill's five-year fetch came first
-    assert all(c is not None for c in f.calls[1:]) and len(f.calls) >= 2
+    assert all(c is not None for c in f.calls[1:])
     assert store.get_backfill("eia").state == BackfillState.DONE
 
 
-async def test_stop_while_backfill_pending_returns_quickly(store, client):
-    s = fast(store, client, [like("eia", Fake())], run_backfill=False)
-    s.run_backfill = True  # loops wait for a backfill nobody runs
+class Hanging:
+    """A fetch that never returns until released."""
+
+    def __init__(self):
+        self.calls = []
+        self.release = asyncio.Event()
+
+    async def __call__(self, client, since=None):
+        self.calls.append(since)
+        await self.release.wait()
+        return []
+
+
+async def test_polls_wait_while_backfill_runs_and_stop_is_prompt(store, client):
+    h = Hanging()
+    s = fast(store, client, [like("eia", h)], run_backfill=True)
     stop = asyncio.Event()
     task = asyncio.create_task(s.run(stop))
-    await asyncio.sleep(0.05)
+    await until(lambda: h.calls == [None])
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert h.calls == [None]  # no poll while the backfill is running
     stop.set()
-    await asyncio.wait_for(task, timeout=1)
+    await asyncio.wait_for(task, timeout=1)  # well inside SHUTDOWN_GRACE
+
+
+async def test_failed_backfill_unblocks_polls(store, client):
+    f = Fake(error=ProviderError("http_status", "503 from api.eia.gov"))
+    s = fast(store, client, [like("eia", f)], run_backfill=True)
+    stop = asyncio.Event()
+    task = asyncio.create_task(s.run(stop))
+    await until(lambda: any(c is not None for c in f.calls))  # a poll ran
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert f.calls[0] is None
+    st = store.get_status("eia")
+    assert st.backfill.state == BackfillState.NOT_STARTED  # failed, not "running"
+    assert st.error_class == "http_status"
+
+
+class LockedStore:
+    """Wraps a Store; chosen methods raise 'database is locked'."""
+
+    def __init__(self, store, failing):
+        self._store = store
+        self.failing = set(failing)
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if name in self.failing:
+
+            def locked(*a, **kw):
+                raise sqlite3.OperationalError("database is locked")
+
+            return locked
+        return attr
+
+
+async def test_loops_survive_a_failing_store(store, client):
+    locked = LockedStore(
+        store,
+        {"upsert_points", "record_failure", "record_success", "series_latest", "get_status"},
+    )
+    f = Fake([brent(day(2026, 10, 13))])
+    s = fast(locked, client, [like("eia", f)], run_backfill=True)
+    stop = asyncio.Event()
+    task = asyncio.create_task(s.run(stop))
+    # The backfill attempt fails on the store, then polls keep failing and coming.
+    await until(lambda: f.calls and s.failures["eia"] >= 3)
+    locked.failing.clear()  # the store recovers
+    await until(lambda: store.latest("eia.spot.brent"))
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert not task.exception()
+
+
+async def test_shutdown_waits_for_writes_in_flight(store, client):
+    started, release = threading.Event(), threading.Event()
+    real = store.upsert_points
+    finished = []
+
+    def slow_upsert(points, *a, **kw):
+        started.set()
+        release.wait(timeout=5)
+        n = real(points, *a, **kw)
+        finished.append(n)
+        return n
+
+    store.upsert_points = slow_upsert
+    s = fast(store, client, [like("eia", Fake([brent(day(2026, 10, 13))]))], run_backfill=False)
+    stop = asyncio.Event()
+    task = asyncio.create_task(s.run(stop))
+    await asyncio.to_thread(started.wait, 5)
+    stop.set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not task.done()  # still draining the write
+    release.set()
+    await asyncio.wait_for(task, timeout=sch.SHUTDOWN_GRACE + 5)
+    assert finished == [1]
+    assert s.io.running == 0
+
+
+def test_empty_selection_means_none(store):
+    assert Scheduler(store, collectors=[], ais=None).collectors == ()
+    assert len(Scheduler(store, ais=None).collectors) == 3
 
 
 # --- AIS ------------------------------------------------------------------------------
 
 
 class FakeAis:
-    def __init__(self, crash_first=False):
-        self.crash_first = crash_first
+    def __init__(self, crashes=0):
+        self.crashes = crashes
         self.runs = 0
         self.status = type("S", (), {"error_class": None, "message": None})()
 
     async def run(self, sink, stop):
         self.runs += 1
-        if self.crash_first and self.runs == 1:
+        if self.runs <= self.crashes:
             raise RuntimeError("bug")
         await sink([Point(SERIES_SHIPS, datetime(2026, 10, 17, 12, 10, tzinfo=UTC), 31.0)])
         await stop.wait()
 
 
 async def test_ais_stream_writes_through_sink(store, client, monkeypatch):
-    monkeypatch.setattr(sch, "AIS_RESTART_START", 0.01)
-    ais = FakeAis(crash_first=True)
+    monkeypatch.setattr(sch, "AIS_RESTART_START", 0.001)
+    ais = FakeAis(crashes=1)
     s = fast(store, client, [], ais=ais, run_backfill=False)
     stop = asyncio.Event()
     task = asyncio.create_task(s.run(stop))
-    for _ in range(100):
-        await asyncio.sleep(0.02)
-        if store.latest(SERIES_SHIPS):
-            break
+    await until(lambda: store.latest(SERIES_SHIPS))
     stop.set()
     await asyncio.wait_for(task, timeout=3)
     assert ais.runs == 2  # restarted after the crash
     assert store.latest(SERIES_SHIPS)[0].value == 31.0
     assert store.get_status("aisstream").error_class is None
+
+
+async def test_ais_restart_delay_resets_after_a_healthy_run(store, client, monkeypatch):
+    waits = []
+
+    async def fake_wait(stop, seconds):
+        waits.append(seconds)
+        await asyncio.sleep(0)
+        return stop.is_set()
+
+    monkeypatch.setattr(sch.backfill, "wait_or_stop", fake_wait)
+    clock = {"t": 0.0}
+    durations = iter([0, 0, 0, 1000, 0])  # three quick crashes, one long run, one more
+
+    class Crashy(FakeAis):
+        async def run(self, sink, stop):
+            self.runs += 1
+            clock["t"] += next(durations, 0)
+            if self.runs >= 6:
+                stop.set()
+                return
+            raise RuntimeError("bug")
+
+    s = fast(store, client, [], ais=Crashy(), run_backfill=False, monotonic=lambda: clock["t"])
+    stop = asyncio.Event()
+    await asyncio.wait_for(s._ais_loop(stop), timeout=2)
+    restarts = [w for w in waits if w != sch.AIS_STATUS_CHECK]
+    assert restarts == [1.0, 2.0, 4.0, 1.0, 2.0]
 
 
 def test_ais_off_without_key(store, monkeypatch):

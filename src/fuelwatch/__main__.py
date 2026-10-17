@@ -37,31 +37,40 @@ def _series_report(store: Store, names: list[str]) -> list[str]:
     from fuelwatch.registry import REGISTRY
 
     lines = []
-    conn = store._conn()
     for name in names:
         ids = [e.id for e in REGISTRY.for_collector(name)]
-        q = ",".join("?" * len(ids))
-        rows, lo, hi, nseries = conn.execute(
-            "SELECT COUNT(*), MIN(period_end), MAX(period_end), COUNT(DISTINCT series) "
-            f"FROM points WHERE series IN ({q})",
-            ids,
-        ).fetchone()
+        rows, present, lo, hi = 0, 0, None, None
+        for sid in ids:
+            pts = store.points(sid)  # oldest first
+            if pts:
+                rows += len(pts)
+                present += 1
+                lo = min(lo, pts[0].period_end) if lo else pts[0].period_end
+                hi = max(hi, pts[-1].period_end) if hi else pts[-1].period_end
 
-        def day(ts):
-            return time.strftime("%Y-%m-%d", time.gmtime(ts)) if ts is not None else "-"
+        def day(t):
+            return t.date().isoformat() if t else "-"
 
         lines.append(
-            f"  {name:16} {rows:7d} rows in {nseries}/{len(ids)} series, {day(lo)} to {day(hi)}"
+            f"  {name:16} {rows:7d} rows in {present}/{len(ids)} series, {day(lo)} to {day(hi)}"
         )
     return lines
+
+
+def _chosen(only: list[str] | None):
+    """--only names, already checked by argparse; none given means all."""
+    from fuelwatch.registry import REGISTRY
+
+    if only is None:
+        return list(REGISTRY.polled)
+    return [REGISTRY.collector(n) for n in dict.fromkeys(only)]
 
 
 async def _backfill(args) -> int:
     from fuelwatch import backfill
     from fuelwatch.http import make_client
-    from fuelwatch.registry import REGISTRY
 
-    collectors = [c for c in REGISTRY.polled if not args.only or c.name in args.only]
+    collectors = _chosen(args.only)
     started = time.monotonic()
     with Store() as store:
         if args.reset:
@@ -88,10 +97,9 @@ async def _backfill(args) -> int:
 
 
 async def _collect_once(args) -> int:
-    from fuelwatch.registry import REGISTRY
     from fuelwatch.scheduler import Scheduler
 
-    collectors = [c for c in REGISTRY.polled if not args.only or c.name in args.only]
+    collectors = _chosen(args.only)
     with Store() as store:
         sched = Scheduler(store, collectors=collectors, ais=None, run_backfill=False)
         results = await sched.poll_all()
@@ -102,6 +110,9 @@ async def _collect_once(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from fuelwatch.registry import REGISTRY
+
+    names = [c.name for c in REGISTRY.polled]
     parser = argparse.ArgumentParser(prog="fuelwatch")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -114,11 +125,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     bf = sub.add_parser("backfill", help="run the five-year backfill for collectors not done")
     bf.add_argument("--reset", action="store_true", help="redo collectors already done")
-    bf.add_argument("--only", action="append", metavar="COLLECTOR", help="limit to a collector")
+    bf.add_argument("--only", action="append", choices=names, help="limit to a collector")
     bf.add_argument("--attempts", type=int, default=3, help="tries per collector (default 3)")
     c = sub.add_parser("collect", help="poll the collectors")
     c.add_argument("--once", action="store_true", required=True, help="poll each once and exit")
-    c.add_argument("--only", action="append", metavar="COLLECTOR", help="limit to a collector")
+    c.add_argument("--only", action="append", choices=names, help="limit to a collector")
     args = parser.parse_args(argv)
 
     if args.command == "backup":

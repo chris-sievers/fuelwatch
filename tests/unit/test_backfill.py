@@ -1,4 +1,6 @@
 import asyncio
+import sqlite3
+import threading
 import time
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -17,6 +19,22 @@ from fuelwatch.store import BackfillState, Store
 
 NOW = datetime(2026, 10, 17, 12, tzinfo=UTC)
 FIX = Path(__file__).parent.parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def small_fakes_are_plausible(monkeypatch):
+    """The fakes return a handful of points; the threshold has its own tests."""
+    monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 0)
+
+
+async def until(cond, timeout=5.0):
+    """Wait for a condition, yielding to the loop; deterministic outcome,
+    the timeout only bounds a broken test."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not cond():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not met")
+        await asyncio.sleep(0.001)
 
 
 @pytest.fixture
@@ -144,7 +162,10 @@ async def test_failure_is_recorded_retried_and_resumable(store, client):
     assert results["portwatch"].state == BackfillState.DONE  # not blocked by eia
     st = store.get_status("eia")
     assert st.error_class == "http_status"
-    assert st.backfill.state == BackfillState.RUNNING
+    # Failed, not "running": nothing is running, and a later run retries.
+    assert st.backfill.state == BackfillState.NOT_STARTED
+    s = backfill.summary(store, [coll("eia", f), coll("portwatch", ok)])
+    assert s.state == "backfilling" and s.errors == {"eia": "429 from api.eia.gov"}
 
 
 async def test_internal_error_message_is_type_only(store, client):
@@ -160,94 +181,197 @@ async def test_stop_ends_retry_wait(store, client):
     task = asyncio.create_task(
         backfill.run(store, client, collectors=[coll("eia", f)], stop=stop, retry_start=60)
     )
-    await asyncio.sleep(0.05)
+    await until(lambda: f.calls)
     stop.set()
     await asyncio.wait_for(task, timeout=1)
 
 
 # --- the event loop keeps running ------------------------------------------------------
+#
+# Deterministic: the blocking work waits (in its thread) for a tick of the
+# event loop. If the work ran on the loop thread, the loop could not tick,
+# the wait would time out and the test would fail.
 
 
-async def _max_gap(coro, interval=0.01):
-    gaps = []
-    done = False
+class LoopProbe:
+    def __init__(self):
+        self.ticked = threading.Event()
+        self.saw_tick: list[bool] = []
+        self._task = None
 
-    async def ticker():
-        last = time.monotonic()
-        while not done:
-            await asyncio.sleep(interval)
-            t = time.monotonic()
-            gaps.append(t - last)
-            last = t
+    async def __aenter__(self):
+        async def tick():
+            while True:
+                await asyncio.sleep(0)
+                self.ticked.set()
 
-    t = asyncio.create_task(ticker())
-    try:
-        result = await coro
-    finally:
-        done = True
-        await t
-    return result, max(gaps), len(gaps)
+        self._task = asyncio.create_task(tick())
+        return self
+
+    async def __aexit__(self, *exc):
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+
+    def blocking(self, fn):
+        """Wrap a blocking function: it records whether the loop ticked
+        while it ran."""
+
+        def wrapper(*a, **kw):
+            self.ticked.clear()
+            self.saw_tick.append(self.ticked.wait(timeout=5))
+            return fn(*a, **kw)
+
+        return wrapper
 
 
 @respx.mock
-async def test_loop_responsive_during_slow_eu_parse(store, client, monkeypatch):
+async def test_loop_runs_during_eu_parse(store, client, monkeypatch):
     content = (FIX / "eu_oil_bulletin" / "history_with_taxes_trimmed.xlsx").read_bytes()
     respx.get(eu_oil_bulletin.HISTORY_URL).mock(
         return_value=httpx.Response(200, content=content, headers={"content-type": "x/xlsx"})
     )
-    real = eu_oil_bulletin.read_rows
-
-    def slow_read_rows(*a, **kw):
-        time.sleep(0.5)  # a slow, blocking parse
-        return real(*a, **kw)
-
-    monkeypatch.setattr(eu_oil_bulletin, "read_rows", slow_read_rows)
-    c = REGISTRY.collector("eu_oil_bulletin")
-    results, gap, ticks = await _max_gap(
-        backfill.run(store, PacedClient(client), collectors=[c], now=lambda: NOW)
-    )
+    async with LoopProbe() as probe:
+        monkeypatch.setattr(eu_oil_bulletin, "read_rows", probe.blocking(eu_oil_bulletin.read_rows))
+        c = REGISTRY.collector("eu_oil_bulletin")
+        results = await backfill.run(store, PacedClient(client), collectors=[c], now=lambda: NOW)
     assert results["eu_oil_bulletin"].state == BackfillState.DONE
-    assert ticks >= 20
-    assert gap < 0.2
+    assert probe.saw_tick == [True]
 
 
-async def test_loop_responsive_during_large_write(store, client):
+async def test_loop_runs_during_writes(store, client, monkeypatch):
     many = [p for s in ("eia.spot.brent", "eia.spot.wti") for p in daily(s, 1830)]
-    many *= 10  # 36,600 points, repeated periods
     c = coll("eia", Fake(many))
-    results, gap, _ = await _max_gap(backfill.run(store, client, collectors=[c], now=lambda: NOW))
+    async with LoopProbe() as probe:
+        monkeypatch.setattr(store, "upsert_points", probe.blocking(store.upsert_points))
+        results = await backfill.run(store, client, collectors=[c], now=lambda: NOW)
     assert results["eia"].rows == len(many)
-    assert gap < 0.2
+    assert len(probe.saw_tick) == 2 and all(probe.saw_tick)  # two 2,000-point chunks
 
 
 @respx.mock
-async def test_loop_responsive_during_real_portwatch_parse(store, client):
+async def test_loop_runs_during_portwatch_parse(store, client, monkeypatch):
     import json
 
     page = json.loads((FIX / "portwatch" / "recent_page1.json").read_text())
     page["exceededTransferLimit"] = False
     respx.get(portwatch.QUERY_URL).mock(return_value=httpx.Response(200, json=page))
-    c = REGISTRY.collector("portwatch")
-    results, gap, _ = await _max_gap(
-        backfill.run(store, PacedClient(client), collectors=[c], now=lambda: NOW)
-    )
+    async with LoopProbe() as probe:
+        monkeypatch.setattr(portwatch, "parse_page", probe.blocking(portwatch.parse_page))
+        monkeypatch.setattr(portwatch, "to_points", probe.blocking(portwatch.to_points))
+        c = REGISTRY.collector("portwatch")
+        results = await backfill.run(store, PacedClient(client), collectors=[c], now=lambda: NOW)
     assert results["portwatch"].rows > 0
-    assert gap < 0.2
+    assert probe.saw_tick == [True, True]
+
+
+# --- plausibility and store failures -----------------------------------------------------
+
+
+async def test_empty_full_backfill_is_a_failure(store, client, monkeypatch):
+    monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 52)
+    f = Fake([])
+    results = await backfill.run(
+        store, client, collectors=[coll("eia", f)], max_attempts=2, retry_start=0.001
+    )
+    assert len(f.calls) == 2  # retried, not marked done
+    assert results["eia"].error.startswith("eia: backfill returned 0 points for 23 series")
+    st = store.get_status("eia")
+    assert st.error_class == "implausible"
+    assert st.backfill.state == BackfillState.NOT_STARTED
+
+
+async def test_implausibly_small_backfill_is_a_failure(store, client, monkeypatch):
+    monkeypatch.setattr(backfill, "MIN_POINTS_PER_SERIES", 52)
+    c = coll("eu_oil_bulletin", Fake(daily("eu_pump_petrol_de", 519)))  # need 52 x 10
+    r = await backfill.backfill_collector(store, client, c)
+    assert r.error is not None and "expected at least 520" in r.error
+    ok = coll("eu_oil_bulletin", Fake(daily("eu_pump_petrol_de", 520)))
+    assert (await backfill.backfill_collector(store, client, ok)).state == BackfillState.DONE
+
+
+async def test_empty_resume_is_a_failure(store, client):
+    store.set_backfill("eia", BackfillState.RUNNING, "2026-10-01", 0.9)
+    r = await backfill.backfill_collector(store, client, coll("eia", Fake([])))
+    assert r.error == "eia: no points since 2026-10-01"
+    assert store.get_backfill("eia").cursor == "2026-10-01"
+
+
+class LockedStore:
+    """Wraps a Store; chosen methods raise 'database is locked'."""
+
+    def __init__(self, store, failing):
+        self._store = store
+        self.failing = set(failing)
+
+    def __getattr__(self, name):
+        attr = getattr(self._store, name)
+        if name in self.failing:
+
+            def locked(*a, **kw):
+                raise sqlite3.OperationalError("database is locked")
+
+            return locked
+        return attr
+
+
+async def test_backfill_survives_a_failing_store(store, client):
+    locked = LockedStore(store, {"get_backfill", "set_backfill", "record_failure"})
+    f = Fake(daily("eia.spot.brent", 5))
+    results = await backfill.run(
+        locked, client, collectors=[coll("eia", f)], max_attempts=2, retry_start=0.001
+    )
+    assert results["eia"].error == "OperationalError"
+    # The store recovers: the next run completes.
+    locked.failing.clear()
+    results = await backfill.run(locked, client, collectors=[coll("eia", f)])
+    assert results["eia"].state == BackfillState.DONE
+
+
+async def test_failed_write_does_not_leave_state_running(store, client):
+    locked = LockedStore(store, {"upsert_points"})
+    r = await backfill.backfill_collector(
+        locked, client, coll("eia", Fake(daily("eia.spot.brent", 5)))
+    )
+    assert r.error == "OperationalError"
+    st = store.get_status("eia")
+    assert st.backfill.state == BackfillState.NOT_STARTED
+    assert st.error_class == "internal" and st.error_message == "OperationalError"
+
+
+async def test_empty_selection_means_none(store, client):
+    f = Fake(daily("eia.spot.brent", 5))
+    assert await backfill.run(store, client, collectors=[]) == {}
+    assert backfill.summary(store, []).collectors == {}
+    assert f.calls == []
 
 
 # --- pacing ------------------------------------------------------------------------------
+
+
+class FakeTime:
+    def __init__(self):
+        self.t = 0.0
+        self.slept: list[float] = []
+
+    def clock(self):
+        return self.t
+
+    async def sleep(self, s):
+        self.slept.append(s)
+        self.t += s
+        await asyncio.sleep(0)
 
 
 @respx.mock
 async def test_paced_client_spaces_and_counts(client):
     respx.get("https://api.eia.gov/v2/x").mock(return_value=httpx.Response(200, json={}))
     respx.get("https://example.org/y").mock(return_value=httpx.Response(200, json={}))
-    p = PacedClient(client, per_host={"api.eia.gov": 0.1})
-    t0 = time.monotonic()
+    ft = FakeTime()
+    p = PacedClient(client, per_host={"api.eia.gov": 0.5}, sleep=ft.sleep, clock=ft.clock)
     for _ in range(3):
         await p.get("https://api.eia.gov/v2/x")
     await p.get("https://example.org/y")
-    assert time.monotonic() - t0 >= 0.2
+    assert ft.slept == [0.5, 0.5]
     assert p.requests == {"api.eia.gov": 3, "example.org": 1}
 
 
@@ -260,28 +384,74 @@ async def test_paced_client_retries_rate_limit(client):
             httpx.Response(200, json={"ok": 1}),
         ]
     )
-    slept = []
-
-    async def sleep(s):
-        slept.append(s)
-
-    p = PacedClient(client, retry_delay=7, sleep=sleep)
+    ft = FakeTime()
+    p = PacedClient(client, retry_delay=7, sleep=ft.sleep, clock=ft.clock)
     resp = await p.get("https://api.eia.gov/v2/x")
     assert resp.status_code == 200 and route.call_count == 3
     assert p.rate_limited == {"api.eia.gov": 2}
-    assert 0 in slept and 7 in slept  # Retry-After, then the default delay
+    assert ft.slept == [7]  # Retry-After: 0 retries at once, then the default delay
 
 
 @respx.mock
 async def test_paced_client_gives_up(client):
     respx.get("https://api.eia.gov/v2/x").mock(return_value=httpx.Response(429))
-
-    async def sleep(s):
-        pass
-
-    p = PacedClient(client, retries=2, sleep=sleep)
+    ft = FakeTime()
+    p = PacedClient(client, retries=2, sleep=ft.sleep, clock=ft.clock)
     assert (await p.get("https://api.eia.gov/v2/x")).status_code == 429
     assert p.requests == {"api.eia.gov": 3}
+
+
+@respx.mock
+async def test_spacing_stays_bounded_through_a_run_of_503s(client, caplog):
+    respx.get("https://api.eia.gov/v2/x").mock(
+        return_value=httpx.Response(503, headers={"retry-after": "1e12"})
+    )
+    ft = FakeTime()
+    p = PacedClient(client, per_host={"api.eia.gov": 0.5}, sleep=ft.sleep, clock=ft.clock)
+    for _ in range(20):  # 20 failed polls, 4 attempts each
+        await p.get("https://api.eia.gov/v2/x")
+    assert p.spacing("api.eia.gov") == 60.0
+    assert max(ft.slept) == 600.0  # Retry-After clamped to max_retry_delay
+    assert "retrying in 600 s" in caplog.text and "1000000000000" not in caplog.text
+
+
+@respx.mock
+async def test_spacing_doubles_once_per_get_and_recovers(client):
+    route = respx.get("https://api.eia.gov/v2/x")
+    route.side_effect = [httpx.Response(503)] * 4 + [httpx.Response(200, json={})]
+    ft = FakeTime()
+    p = PacedClient(client, per_host={"api.eia.gov": 0.5}, sleep=ft.sleep, clock=ft.clock)
+    await p.get("https://api.eia.gov/v2/x")  # four 503s
+    assert p.spacing("api.eia.gov") == 1.0  # doubled once (at least 1 s), not four times
+    await p.get("https://api.eia.gov/v2/x")  # success
+    assert p.spacing("api.eia.gov") == 0.5
+
+
+async def test_stop_interrupts_a_long_wait(client):
+    from fuelwatch.http import Stopped
+
+    stop = asyncio.Event()
+    p = PacedClient(client, per_host={"api.eia.gov": 3600.0}, stop=stop)
+    p._next["api.eia.gov"] = p._clock() + 3600.0  # the host's next slot is an hour away
+    task = asyncio.create_task(p.get("https://api.eia.gov/v2/x"))
+    await asyncio.sleep(0)
+    stop.set()
+    with pytest.raises(Stopped):
+        await asyncio.wait_for(task, timeout=1)
+    assert p.requests == {}
+
+
+async def test_pacing_never_sleeps_holding_the_lock(client):
+    stop = asyncio.Event()
+    p = PacedClient(client, per_host={"a.example": 3600.0}, stop=stop)
+    p._next["a.example"] = p._clock() + 3600.0
+    slow = asyncio.create_task(p._pace("a.example"))
+    await asyncio.sleep(0)
+    # Another host is not held up by the sleeping one.
+    await asyncio.wait_for(p._pace("b.example"), timeout=1)
+    stop.set()
+    with pytest.raises(Exception):  # noqa: B017 - Stopped
+        await slow
 
 
 # --- the CLI -----------------------------------------------------------------------------
@@ -324,3 +494,13 @@ def test_cli_backfill_and_collect_once(tmp_path, monkeypatch, capsys):
         ("portwatch.suez.all", date(2026, 10, 10) - timedelta(days=35)),
     ]
     assert "10 points" in out
+
+
+def test_cli_unknown_collector_is_an_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("FW_DATA_DIR", str(tmp_path))
+    for argv in (["backfill", "--only", "eai"], ["collect", "--once", "--only", "eai"]):
+        with pytest.raises(SystemExit) as ei:
+            cli_main(argv)
+        assert ei.value.code == 2
+        err = capsys.readouterr().err
+        assert "invalid choice: 'eai'" in err and "eia" in err and "portwatch" in err
