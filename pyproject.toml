@@ -30,7 +30,7 @@ dev = [
 # The UI tests (tests/ui): headless Chromium. Also run
 # `python -m playwright install chromium` once.
 ui = [
-  "playwright==1.63.0",
+  "playwright==1.64.0",
 ]
 
 [tool.hatch.build.targets.wheel]
